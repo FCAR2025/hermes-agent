@@ -1497,6 +1497,15 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
+    # Empty-exhausted proxy marks are turn-scoped — clear them at turn start so a
+    # transient proxy blip does not permanently blacklist a backend (FIX 4).
+    try:
+        marks = getattr(agent, "_empty_exhausted_base_urls", None)
+        if marks:
+            marks.clear()
+    except Exception:
+        pass
+
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was

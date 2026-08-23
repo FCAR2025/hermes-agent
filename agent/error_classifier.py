@@ -909,6 +909,33 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Anthropic "timeout_error" for an over-large / over-complex request:
+    #   "Request timed out. The operation may have been too complex.
+    #    Try a simpler request."
+    # This is a SIZE/complexity rejection, NOT a transient network timeout — the
+    # API's own remedy is "a simpler request". Route it to the compress-and-
+    # retry-PRIMARY path (context_overflow) so the request shrinks and succeeds on
+    # the primary, instead of being treated as a transient timeout that exhausts
+    # retries and cascades to the (often empty) fallback pond — the genesis of the
+    # 2026-06-07 "Joy goes silent" stall. Bounded by max_compression_attempts, so a
+    # genuinely-small request that still times out fails cleanly rather than
+    # looping. Placed high-priority so it wins over the generic timeout-message
+    # classifier. See tests/agent/test_error_classifier.py +
+    # tests/run_agent/test_empty_exhaustion_stall.py.
+    # Match the FULL distinctive Anthropic phrasing, not a bare "too complex"
+    # substring — "too complex" alone can appear in unrelated errors (e.g. a
+    # provider "regex/query too complex" validation message) and must NOT be
+    # force-compressed. Both phrases below are specific to this timeout_error.
+    if (
+        "operation may have been too complex" in error_msg
+        or "try a simpler request" in error_msg
+    ):
+        return _result(
+            FailoverReason.context_overflow,
+            retryable=True,
+            should_compress=True,
+        )
+
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking
     # blocks — see the thinking_signature handler in conversation_loop.py):

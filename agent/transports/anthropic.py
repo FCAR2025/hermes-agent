@@ -77,6 +77,101 @@ class AnthropicTransport(ProviderTransport):
             drop_context_1m_beta=params.get("drop_context_1m_beta", False),
         )
 
+    @staticmethod
+    def _reparse_sse_to_messages(raw: Any):
+        """Reconstruct a Messages-like object from a raw Anthropic SSE stream str.
+
+        FIX 5: a local shim proxy (the :3456 Claude-Max proxy) can return the
+        streaming SSE body (``:ok\\n\\nevent: message_start\\ndata: {...}``) to a
+        NON-streaming aux call (title-gen / vision / compression).  The Anthropic
+        SDK then hands the raw text to ``normalize_response`` as a ``str`` instead
+        of a parsed Messages object — the cryptic failure that spammed aux tasks
+        (40x ``'str' object has no attribute 'content'`` before the guard).  Parse
+        the common text / thinking / tool_use blocks + stop_reason so the aux task
+        SUCCEEDS instead of merely failing cleanly.  Returns a SimpleNamespace
+        ``(content=[...], stop_reason=..., usage=None)`` or ``None`` when the string
+        is not a parseable SSE stream (plain error bodies still fall through to the
+        TypeError guard).  See tests/agent/transports/test_transport.py.
+        """
+        import json as _json
+        from types import SimpleNamespace as _NS
+
+        if not isinstance(raw, str) or "data:" not in raw:
+            return None
+        events = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue  # skip ``:ok`` comment lines, ``event:`` lines, blanks
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                events.append(_json.loads(payload))
+            except Exception:
+                continue
+        if not events:
+            return None
+
+        blocks: dict = {}
+        stop_reason = None
+        saw_message = False
+        for ev in events:
+            et = ev.get("type")
+            if et == "message_start":
+                saw_message = True
+            elif et == "content_block_start":
+                idx = ev.get("index", 0)
+                cb = ev.get("content_block", {}) or {}
+                blocks[idx] = {
+                    "type": cb.get("type", "text"),
+                    "text": cb.get("text", "") or "",
+                    "thinking": cb.get("thinking", "") or "",
+                    "name": cb.get("name"),
+                    "id": cb.get("id"),
+                    "input": cb.get("input") if isinstance(cb.get("input"), dict) else {},
+                    "input_json": "",
+                }
+            elif et == "content_block_delta":
+                idx = ev.get("index", 0)
+                d = ev.get("delta", {}) or {}
+                b = blocks.setdefault(idx, {
+                    "type": "text", "text": "", "thinking": "",
+                    "name": None, "id": None, "input": {}, "input_json": "",
+                })
+                dt = d.get("type")
+                if dt == "text_delta":
+                    b["text"] += d.get("text", "") or ""
+                elif dt == "thinking_delta":
+                    b["thinking"] += d.get("thinking", "") or ""
+                elif dt == "input_json_delta":
+                    b["input_json"] += d.get("partial_json", "") or ""
+            elif et == "message_delta":
+                d = ev.get("delta", {}) or {}
+                if d.get("stop_reason"):
+                    stop_reason = d.get("stop_reason")
+        if not saw_message and not blocks:
+            return None
+
+        out_blocks = []
+        for idx in sorted(blocks):
+            b = blocks[idx]
+            bt = b.get("type")
+            if bt == "thinking":
+                out_blocks.append(_NS(type="thinking", thinking=b.get("thinking", "")))
+            elif bt == "tool_use":
+                inp = b.get("input") or {}
+                if not inp and b.get("input_json"):
+                    try:
+                        inp = _json.loads(b["input_json"])
+                    except Exception:
+                        inp = {}
+                out_blocks.append(_NS(type="tool_use", name=b.get("name"),
+                                      id=b.get("id"), input=inp))
+            else:
+                out_blocks.append(_NS(type="text", text=b.get("text", "")))
+        return _NS(content=out_blocks, stop_reason=stop_reason or "end_turn", usage=None)
+
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Anthropic response to NormalizedResponse.
 
@@ -106,7 +201,38 @@ class AnthropicTransport(ProviderTransport):
         # tests/agent/test_anthropic_thinking_block_order.py.
         ordered_blocks = []
 
-        for block in response.content:
+        # ── Defensive shape guard ──────────────────────────────────
+        # Local OpenAI→Anthropic shim proxies (e.g. the :3456 Claude-Max
+        # proxy / :51199 antigravity proxy) can hand back a bare *string*
+        # or dict error body instead of a Messages object when rate-limited
+        # or erroring. Iterating ``response.content`` then raised the cryptic
+        # ``AttributeError: 'str' object has no attribute 'content'`` that
+        # spammed vision / title-generation / context-compression auxiliary
+        # tasks. Validate the shape first and raise a clear, catchable error
+        # carrying a snippet of the offending payload so callers' existing
+        # try/except degrade gracefully instead of crashing on an attribute.
+        content_blocks = getattr(response, "content", None)
+        if not isinstance(content_blocks, list):
+            # FIX 5: a shim proxy may hand back the raw SSE stream string to a
+            # non-streaming aux call. Reconstruct the Messages object so the aux
+            # task (title / vision / compression) succeeds instead of failing on a
+            # bare str. Plain (non-SSE) error bodies return None here and fall
+            # through to the clear, catchable TypeError below.
+            _reparsed = self._reparse_sse_to_messages(response)
+            if _reparsed is not None:
+                response = _reparsed
+                content_blocks = _reparsed.content
+            if not isinstance(content_blocks, list):
+                snippet = repr(response)
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
+                raise TypeError(
+                    "AnthropicTransport.normalize_response expected a Messages "
+                    "object with a list `.content`; got "
+                    f"{type(response).__name__}: {snippet}"
+                )
+
+        for block in content_blocks:
             block_dict = _to_plain_data(block)
             clean_block = None
             if isinstance(block_dict, dict):

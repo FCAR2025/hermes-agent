@@ -1905,6 +1905,30 @@ class AIAgent:
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
                 return
+        # Stall guard (local patch): when the empty-exhaustion breaker is
+        # tripped, every backend is returning empty — do NOT pile autonomous
+        # review work onto a dead transport (that respin is exactly what made
+        # Joy "go silent" on 2026-06-07).
+        # See tests/run_agent/test_empty_exhaustion_stall.py.
+        if self._empty_exhaustion_breaker_tripped():
+            try:
+                logger.warning(
+                    "bg-review skipped: empty-exhaustion breaker tripped "
+                    "(%d consecutive whole-chain empty-exhaustions) — transport "
+                    "degraded, not spawning autonomous review",
+                    getattr(self, "_consecutive_empty_exhaustions", 0),
+                )
+            except Exception:
+                pass
+            return
+        # The review fork REUSES this agent object; restore the primary runtime
+        # first so it never inherits a degraded fallback model/proxy from the
+        # turn that just ended (the bg-review-on-dead-fallback respin bug,
+        # local patch).
+        try:
+            self._restore_primary_runtime()
+        except Exception:
+            pass
         from agent.background_review import (
             finish_background_review_run,
             prepare_background_review_run,
@@ -7079,6 +7103,41 @@ class AIAgent:
         chain = getattr(self, "_fallback_chain", None) or []
         index = getattr(self, "_fallback_index", 0)
         return index < len(chain)
+
+    # ── Empty-exhaustion circuit breaker (stall guard) ───────────────────
+    # When a turn empty-exhausts the WHOLE fallback chain, the agent is pinned to
+    # a dead backend.  Counting CONSECUTIVE such turns lets autonomous background
+    # work (bg-review / skill curation) stop re-firing into a dead transport — the
+    # mechanism that turned a transient outage into Joy "going silent" (2026-06-07).
+    # Reset only on a successful content turn.  See
+    # tests/run_agent/test_empty_exhaustion_stall.py.
+
+    def _note_empty_exhaustion(self) -> None:
+        self._consecutive_empty_exhaustions = (
+            getattr(self, "_consecutive_empty_exhaustions", 0) + 1
+        )
+
+    def _reset_empty_exhaustion(self) -> None:
+        self._consecutive_empty_exhaustions = 0
+
+    def _empty_exhaustion_breaker_tripped(self) -> bool:
+        from agent.chat_completion_helpers import EMPTY_EXHAUSTION_BREAKER_THRESHOLD
+        return (
+            getattr(self, "_consecutive_empty_exhaustions", 0)
+            >= EMPTY_EXHAUSTION_BREAKER_THRESHOLD
+        )
+
+    def _mark_proxy_empty_exhausted(self, base_url) -> None:
+        """Mark a proxy/base_url as having empty-exhausted this turn so the
+        fallback walker skips its other chain entries (proxy diversity).  Cleared
+        at the next turn's restore_primary_runtime()."""
+        if not base_url:
+            return
+        marks = getattr(self, "_empty_exhausted_base_urls", None)
+        if marks is None:
+            marks = set()
+            self._empty_exhausted_base_urls = marks
+        marks.add(str(base_url).rstrip("/").lower())
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 

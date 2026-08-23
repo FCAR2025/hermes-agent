@@ -7835,6 +7835,11 @@ def run_conversation(
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
                     if _truly_empty and agent._fallback_chain:
+                        # Within-turn proxy diversity (FIX 4): the model on the
+                        # CURRENT base_url just empty-exhausted its retries — mark
+                        # that proxy so the fallback walker skips its other chain
+                        # entries instead of churning every model on one dead proxy.
+                        agent._mark_proxy_empty_exhausted(getattr(agent, "base_url", ""))
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",
@@ -7887,6 +7892,12 @@ def run_conversation(
                         )
                     agent._flush_status_buffer()
                     _turn_exit_reason = "empty_response_exhausted"
+                    # Stall guard (FIX 3): the whole fallback chain empty-exhausted
+                    # this turn. Count it for the cross-turn circuit breaker and
+                    # mark the active proxy so the next turn / background job does
+                    # not re-fire into a dead backend. Reset on success below.
+                    agent._note_empty_exhaustion()
+                    agent._mark_proxy_empty_exhausted(getattr(agent, "base_url", ""))
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -7951,6 +7962,9 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
+                # Real content arrived — the transport is healthy; clear the
+                # consecutive empty-exhaustion breaker so autonomous work resumes.
+                agent._reset_empty_exhaustion()
                 # Successful content reached — surface the one-shot fallback
                 # switch notice (if a fallback activated this turn) before
                 # dropping the noisy retry buffer, so a provider/model switch

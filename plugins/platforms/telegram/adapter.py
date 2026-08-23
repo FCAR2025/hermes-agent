@@ -4793,12 +4793,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
-                        logger.warning("[%s] Telegram network _redact_telegram_error_text(error), scheduling reconnect: %s", self.name, error)
+                        logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error))
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     else:
-                        logger.error("[%s] Telegram polling _redact_telegram_error_text(error): %s", self.name, error, exc_info=True)
+                        logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error), exc_info=True)
 
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
@@ -7151,6 +7151,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Instar loop decision callbacks (gate:...:approve/hold/kill) ---
+        if await self._maybe_handle_instar_loop_callback(
+            query,
+            data,
+            query_chat_id=query_chat_id,
+            query_thread_id=query_thread_id,
+        ):
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -9598,6 +9607,145 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _maybe_handle_fcar_gateway_command(self, event: MessageEvent) -> bool:
+        """Consume FCAR Action Gateway commands without touching Hermes approvals.
+
+        Hermes native /approve and /deny remain owned by the native approval
+        mechanism. FCAR gateway commands must use the namespaced
+        /fcar_gateway_* lane and only append to the FCAR gateway ledger.
+        """
+        try:
+            from gateway.fcar_action_gateway_commands import handle_fcar_gateway_command
+
+            source = getattr(event, "source", None)
+            extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+            gateway_dir = extra.get("fcar_action_gateway_dir") or os.getenv(
+                "FCAR_ACTION_GATEWAY_DIR",
+                "/home/info/.omx/action-gateway",
+            )
+            reviewer = "telegram"
+            user_id = getattr(source, "user_id", None)
+            if user_id:
+                reviewer = f"telegram:{user_id}"
+
+            result = handle_fcar_gateway_command(
+                getattr(event, "text", None),
+                gateway_dir=_Path(str(gateway_dir)),
+                reviewer=reviewer,
+                allowed_reviewers=extra.get("fcar_action_gateway_operators"),
+            )
+            if not result.consumed:
+                return False
+
+            chat_id = getattr(source, "chat_id", None)
+            if chat_id is None:
+                return True
+
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": (result.text or "FCAR gateway command consumed.")[:3900],
+            }
+            thread_id = getattr(source, "thread_id", None)
+            if thread_id:
+                try:
+                    send_kwargs["message_thread_id"] = int(thread_id)
+                except (TypeError, ValueError):
+                    pass
+            await self._send_message_with_thread_fallback(**send_kwargs)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] FCAR gateway command handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
+            return True
+
+    async def _maybe_handle_instar_loop_decision(self, event: MessageEvent) -> bool:
+        """Consume Instar loop decisions from Hermes-owned Telegram inbound.
+
+        Instar must not call Telegram ``getUpdates`` directly while Hermes owns
+        inbound polling.  This bridge only receives already-delivered Telegram
+        text from Hermes and appends safe decision rows to Instar's ledger.
+        """
+        try:
+            scripts_dir = _Path("/home/info/scripts")
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from hermes_instar_decision_bridge import handle_text
+
+            source = getattr(event, "source", None)
+            result = handle_text(
+                getattr(event, "text", None),
+                chat_id=getattr(source, "chat_id", None),
+                message_id=getattr(event, "message_id", None),
+                user_id=getattr(source, "user_id", None),
+            )
+            if not result.consumed:
+                return False
+
+            chat_id = getattr(source, "chat_id", None)
+            if chat_id is None:
+                return True
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": (result.text or "Instar loop decision consumed.")[:3900],
+            }
+            thread_id = getattr(source, "thread_id", None)
+            if thread_id:
+                try:
+                    send_kwargs["message_thread_id"] = int(thread_id)
+                except (TypeError, ValueError):
+                    pass
+            await self._send_message_with_thread_fallback(**send_kwargs)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Instar loop decision handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
+            return True
+
+    async def _maybe_handle_instar_loop_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_thread_id,
+    ) -> bool:
+        """Consume Instar inline decision buttons without touching other callbacks."""
+        try:
+            scripts_dir = _Path("/home/info/scripts")
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from hermes_instar_decision_bridge import handle_callback
+
+            query_message = getattr(query, "message", None)
+            result = handle_callback(
+                data,
+                chat_id=query_chat_id,
+                message_id=getattr(query_message, "message_id", None),
+                user_id=getattr(getattr(query, "from_user", None), "id", None),
+                message_date=getattr(query_message, "date", None),
+            )
+            if not result.consumed:
+                return False
+
+            await query.answer(text=(result.text or "Instar decision consumed.")[:190])
+            if query_chat_id is not None and result.text:
+                send_kwargs: Dict[str, Any] = {
+                    "chat_id": int(query_chat_id),
+                    "text": result.text[:3900],
+                }
+                if query_thread_id is not None:
+                    try:
+                        send_kwargs["message_thread_id"] = int(query_thread_id)
+                    except (TypeError, ValueError):
+                        pass
+                await self._send_message_with_thread_fallback(**send_kwargs)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Instar loop callback handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
+            try:
+                await query.answer(text="Instar decision failed closed.")
+            except Exception:
+                pass
+            return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -9629,6 +9777,8 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        if await self._maybe_handle_instar_loop_decision(event):
+            return
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9650,6 +9800,10 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
+        if await self._maybe_handle_fcar_gateway_command(event):
+            return
+        if await self._maybe_handle_instar_loop_decision(event):
+            return
         event = self._apply_telegram_group_observe_attribution(event)
         # Telegram clients split messages above 4096 chars into multiple
         # updates.  A long command paste (e.g. ``/queue <huge prompt>``)

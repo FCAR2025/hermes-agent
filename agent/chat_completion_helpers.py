@@ -2423,6 +2423,31 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+# Consecutive whole-chain empty-exhaustions before the autonomous-work circuit
+# breaker trips (stall guard — see tests/run_agent/test_empty_exhaustion_stall.py
+# and the 2026-06-07 "Joy goes silent" root-cause).  Kept module-level so both the
+# conversation loop and AIAgent._empty_exhaustion_breaker_tripped() share one value.
+EMPTY_EXHAUSTION_BREAKER_THRESHOLD = 3
+
+
+def should_return_partial_stub(partial_text, partial_tool_names) -> bool:
+    """Decide whether a partial-stream failure should yield a continuable stub.
+
+    A stub (content=partial_text, finish_reason=length) is correct ONLY when the
+    failure actually recovered something worth continuing from:
+      * visible text the user already saw (don't re-stream / don't discard it), or
+      * dropped tool-call names worth surfacing as a warning.
+
+    A 0-char, no-tool failure must instead be raised as a transport error.
+    Returning an empty (content=None, finish_reason=length) stub makes the
+    conversation loop mistake a dead transport for a *legitimately-empty model
+    turn*, which triggers the empty -> fallback -> exhaustion stall cascade that
+    took Joy silent on 2026-06-07.  See test_empty_exhaustion_stall.py (FIX 1).
+    """
+    if partial_tool_names:
+        return True
+    return bool(partial_text and str(partial_text).strip())
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -2597,6 +2622,28 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # not pin api_mode explicitly. An explicit fb.api_mode (even
         # "chat_completions") must never be overridden here.
         fb_base_url = str(fb_client.base_url)
+
+        # FIX 4 (proxy-diverse fallback): skip chain entries routed through a
+        # proxy that already empty-exhausted this turn.  The fallback chain
+        # typically has MODEL diversity but not PROXY diversity (every entry on
+        # one local shim proxy, e.g. :51199).  Once that proxy is returning empty,
+        # cycling its other models is pointless churn that just deepens the stall.
+        # The per-turn mark is set by the conversation loop on empty-exhaustion and
+        # cleared at the next turn's restore_primary_runtime().  See
+        # tests/run_agent/test_empty_exhaustion_stall.py.
+        _exhausted_proxies = getattr(agent, "_empty_exhausted_base_urls", None) or set()
+        if fb_base_url.rstrip("/").lower() in _exhausted_proxies:
+            logger.warning(
+                "Fallback skip: %s/%s is on empty-exhausted proxy %s — skipping to "
+                "preserve proxy diversity",
+                fb_provider, fb_model, fb_base_url,
+            )
+            try:
+                fb_client.close()
+            except Exception:
+                pass
+            return agent._try_activate_fallback(reason)
+
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
@@ -5244,6 +5291,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Append a user-visible warning if tool calls were dropped so
             # the user and model both know what was attempted.
             _partial_names = list(result.get("partial_tool_names") or [])
+            if not should_return_partial_stub(_partial_text, _partial_names):
+                # FIX 1: nothing was actually recovered (0 visible chars + no
+                # dropped tool calls).  Surface the real transport error so the
+                # main retry loop's timeout / compression / primary-recovery path
+                # handles it.  Returning an empty length stub here makes the loop
+                # treat a dead transport as a legitimately-empty model turn, which
+                # is the trigger for the empty -> fallback -> exhaustion stall.
+                # See tests/run_agent/test_empty_exhaustion_stall.py.
+                logger.warning(
+                    "Partial stream failed with 0 recovered chars and no dropped "
+                    "tool calls — raising transport error instead of an empty "
+                    "continuable stub: %s",
+                    result["error"],
+                )
+                raise result["error"]
             if _partial_names:
                 _name_str = ", ".join(_partial_names[:3])
                 if len(_partial_names) > 3:
