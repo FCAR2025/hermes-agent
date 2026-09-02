@@ -1433,6 +1433,51 @@ def _resolve_named_custom_model_id(
 
 
 # ---------------------------------------------------------------------------
+# Configured-endpoint pin (Claude-family names must not leave the proxy lane)
+# ---------------------------------------------------------------------------
+
+_CLAUDE_FAMILY_RE = re.compile(r"^(claude|fable|opus|sonnet|haiku)([-_.:]|$)")
+
+
+def is_claude_family_model(name: str) -> bool:
+    """True when *name* is a Claude-family model id or proxy-only alias.
+
+    Matches ``claude-*``, ``fable``, ``opus``, ``sonnet``, ``haiku`` and their
+    suffixed forms.  Deliberately loose: the point is to catch names the
+    configured Anthropic-messages proxy serves, including aliases (``fable``)
+    that exist in no static catalog.
+    """
+    return bool(_CLAUDE_FAMILY_RE.match(str(name or "").strip().lower()))
+
+
+def configured_anthropic_proxy_lane() -> Optional[tuple]:
+    """Return the configured default lane as ``(provider, base_url, api_mode)``.
+
+    Only returns a lane when config.yaml ``model:`` declares a custom
+    Anthropic-messages endpoint (``provider: custom`` / ``custom:<slug>``,
+    non-empty ``base_url``, ``api_mode: anthropic_messages``) — i.e. the
+    operator routes Claude traffic through a proxy.  Any other shape, or any
+    config failure, returns ``None`` so callers become a no-op.
+    """
+    try:
+        from hermes_cli.config import load_config
+        model_cfg = load_config().get("model")
+        if not isinstance(model_cfg, dict):
+            return None
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        api_mode = str(model_cfg.get("api_mode") or "").strip()
+    except Exception:
+        return None
+    lowered = provider.lower()
+    if lowered != "custom" and not lowered.startswith("custom:"):
+        return None
+    if not base_url or api_mode != "anthropic_messages":
+        return None
+    return provider, base_url, api_mode
+
+
+# ---------------------------------------------------------------------------
 # Core model-switching pipeline
 # ---------------------------------------------------------------------------
 
@@ -1499,6 +1544,9 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    # Step d.7 result: (provider, base_url, api_mode) of the configured proxy
+    # lane when a Claude-family name was pinned to it.  None = not pinned.
+    endpoint_pin: Optional[tuple] = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1807,6 +1855,33 @@ def switch_model(
                     if isinstance(user_providers, dict) and target_provider in user_providers:
                         explicit_provider = target_provider
 
+        # --- Step d.7: configured-endpoint pin ---
+        # A Claude-family name typed on a session that drifted off the
+        # configured lane (e.g. sitting on the codex fallback after a failover)
+        # must go back to the operator's configured Anthropic-messages proxy,
+        # not to whatever vendor the static catalog detects.  Without this,
+        # `/model claude-opus-5` from openai-codex made step e detect
+        # `anthropic` and pinned the session to api.anthropic.com — bypassing
+        # the proxy (Max subscription -> API billing), and proxy-only aliases
+        # such as `fable` then 404 on every turn.
+        # Deliberately narrow: only when nothing earlier resolved the name, and
+        # only for Claude-family names.  `gpt-*` and friends are untouched.
+        if (
+            not resolved_alias
+            and not resolved_in_current_catalog
+            and not config_routed
+            and target_provider == current_provider
+            and is_claude_family_model(new_model)
+        ):
+            _lane = configured_anthropic_proxy_lane()
+            if _lane is not None:
+                endpoint_pin = _lane
+                target_provider = _lane[0]
+                logger.info(
+                    "Configured-endpoint pin routed '%s' to %s (%s)",
+                    new_model, target_provider, _lane[1],
+                )
+
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
         is_custom = (
@@ -1821,6 +1896,7 @@ def switch_model(
             and not resolved_alias
             and not resolved_in_current_catalog
             and not config_routed
+            and endpoint_pin is None
         ):
             detected = detect_provider_for_model(new_model, current_provider)
             if detected:
@@ -1851,7 +1927,29 @@ def switch_model(
     validation_headers: dict[str, str] = {}
     suppress_ollama_headers = False
 
-    if provider_changed or explicit_provider:
+    if endpoint_pin is not None:
+        # Step d.7 pin: the configured proxy lane's endpoint is authoritative.
+        # Never inherit the session's current (vendor-direct) base_url — that
+        # is exactly the bypass this step exists to close.
+        _pin_provider, _pin_base_url, _pin_api_mode = endpoint_pin
+        base_url = _pin_base_url
+        api_mode = _pin_api_mode
+        api_key = ""
+        try:
+            runtime = resolve_runtime_provider(
+                requested=_pin_provider,
+                explicit_base_url=_pin_base_url,
+                target_model=new_model,
+            )
+            api_key = runtime.get("api_key", "") or ""
+        except Exception:
+            logger.debug(
+                "Credential resolution failed for pinned lane %s (%s)",
+                _pin_provider, _pin_base_url, exc_info=True,
+            )
+        if not api_key:
+            api_key = "no-key-required"
+    elif provider_changed or explicit_provider:
         # User-config providers (providers.<name> in config.yaml) carry their
         # own base_url + transport + key reference. resolve_runtime_provider()
         # resolves by provider NAME and doesn't know user-config slugs (e.g. a

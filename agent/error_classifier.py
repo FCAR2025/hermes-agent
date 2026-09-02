@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -375,6 +376,13 @@ _MODEL_NOT_FOUND_PATTERNS = [
     # instead of automatically failing over.  See PR #58446.
     "no endpoints found that support tool use",
 ]
+
+# Anthropic answers an unknown model id with a 404 whose body is
+# ``{'type': 'not_found_error', 'message': 'model: <id>'}`` — it names no
+# phrase in _MODEL_NOT_FOUND_PATTERNS, so the generic-404 branch treated a
+# deterministic rejection as retryable and burned three attempts per turn
+# before failing over (2026-09-02: `/model fable` pinned to api.anthropic.com).
+_ANTHROPIC_MODEL_404_RE = re.compile(r"""\bmodel:\s*['\"]?[A-Za-z0-9._:/-]+""")
 
 
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
@@ -1311,6 +1319,14 @@ def _classify_by_status(
         # like an outage (#78796). Deterministic: don't retry, and let the
         # model_not_found surface carry the real cause.
         if _model_id_missing_known_prefix(model, provider):
+            return result_fn(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_fallback=True,
+            )
+        # Anthropic's ``not_found_error`` naming a model id: deterministic,
+        # so don't retry — fail over instead (see _ANTHROPIC_MODEL_404_RE).
+        if "not_found_error" in error_msg and _ANTHROPIC_MODEL_404_RE.search(error_msg):
             return result_fn(
                 FailoverReason.model_not_found,
                 retryable=False,

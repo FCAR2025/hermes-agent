@@ -26495,6 +26495,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "base_url": persisted.get("base_url"),
         }
         provider = persisted.get("provider")
+        # --- Sanitize a vendor-direct override back onto the configured lane ---
+        # A `/model claude-*` typed while the session sat off-lane could pin the
+        # session to api.anthropic.com (see the switch_model step-d.7 pin). Such
+        # an override was persisted and would rehydrate forever after a restart:
+        # Max-subscription traffic billed as API, and proxy-only aliases
+        # (`fable`) 404ing on every turn. Rewrite it to the configured proxy lane
+        # here so a gateway restart heals already-poisoned sessions.
+        if str(provider or "").strip().lower() == "anthropic":
+            try:
+                from hermes_cli.model_switch import (
+                    configured_anthropic_proxy_lane,
+                    is_claude_family_model,
+                )
+                _lane = configured_anthropic_proxy_lane()
+            except Exception:
+                _lane = None
+            if _lane is not None and is_claude_family_model(override.get("model")):
+                _old_provider, _old_base = provider, override.get("base_url")
+                provider = _lane[0]
+                override["provider"] = _lane[0]
+                override["base_url"] = _lane[1]
+                try:
+                    store.set_model_override(
+                        session_key,
+                        {
+                            "model": override.get("model"),
+                            "provider": override.get("provider"),
+                            "base_url": override.get("base_url"),
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist sanitized session model override",
+                        exc_info=True,
+                    )
+                logger.warning(
+                    "Sanitized persisted /model override for session=%s: "
+                    "%s@%s -> %s@%s (configured proxy lane)",
+                    session_key, _old_provider, _old_base, _lane[0], _lane[1],
+                )
         if provider:
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
