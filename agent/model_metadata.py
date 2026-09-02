@@ -422,8 +422,14 @@ DEFAULT_CONTEXT_LENGTHS = {
     # fuzzy-match collisions (e.g. "anthropic/claude-sonnet-4" is a
     # substring of "anthropic/claude-sonnet-4.6").
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
+    # Claude Code exposes the newest Fable release through both the versioned
+    # public IDs and the bare ``fable`` CLI alias. Keep the bare alias here:
+    # otherwise a /model switch to ``fable`` misses every provider catalogue
+    # and silently falls through to DEFAULT_FALLBACK_CONTEXT (256K).
+    "claude-fable-5-1": 1000000,
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
+    "fable": 1000000,
     "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
