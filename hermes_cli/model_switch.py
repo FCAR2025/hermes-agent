@@ -1476,6 +1476,13 @@ _ANTHROPIC_API_MODES: frozenset[str] = frozenset({
 # is the bypass, whatever resolved it.
 VENDOR_DIRECT_CLAUDE_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openrouter"})
 
+# Refusal shown when the lane cannot be read at all.  Routing a Claude name
+# without knowing where the configured lane points is the bypass itself.
+_CONFIG_UNREADABLE_MSG = (
+    "config.yaml unreadable — refusing to route a Claude model off the "
+    "configured lane"
+)
+
 
 def is_claude_family_model(name: str) -> bool:
     """True when *name* is a Claude-family model id or proxy-only alias.
@@ -1509,6 +1516,54 @@ def _config_lane_api_key(raw: Any) -> str:
     return key
 
 
+def _read_raw_config_document() -> dict:
+    """Parse ``config.yaml`` STRICTLY, raising when it cannot be read.
+
+    Deliberately not ``load_config()``: that helper is failure-tolerant by
+    design — a missing or malformed file falls back to ``DEFAULT_CONFIG``, so
+    an unreadable config is indistinguishable from one that declares no proxy
+    lane.  For a routing decision that gates real money that fallback fails
+    OPEN, which is the whole class of bug this module exists to close.
+
+    Reading the raw document also keeps ``${ENV}`` references unexpanded:
+    ``load_config`` expands them from the process-global environment, which
+    under the multiplexed gateway can hand this profile another profile's
+    credential.  The lane's key goes through the per-profile secret scope
+    instead (see :func:`_config_lane_api_key`).
+
+    Raises:
+        ConfigLaneUnavailable: the file is missing, unreadable, not valid
+            YAML, or does not parse to a mapping.
+    """
+    import yaml
+
+    from hermes_cli.config import get_config_path
+
+    try:
+        path = get_config_path()
+        with open(path, "r", encoding="utf-8") as fh:
+            document = yaml.safe_load(fh)
+    except FileNotFoundError:
+        # A config that does not EXIST is not a config we failed to read: it
+        # unambiguously declares no configured lane (fresh install, or a
+        # HERMES_HOME with nothing in it).  Failing closed here would refuse
+        # every Claude switch on a box that simply has no config yet.
+        return {}
+    except (OSError, yaml.YAMLError) as exc:
+        # The file exists but we cannot see through it (permissions, IO error,
+        # corrupt YAML).  A lane may well be configured in there — refuse.
+        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
+    except Exception as exc:  # path resolution itself failed
+        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        raise ConfigLaneUnavailable(
+            f"config.yaml is a {type(document).__name__}, not a mapping"
+        )
+    return document
+
+
 def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
     """Return the configured default lane, or ``None`` when it is not a proxy.
 
@@ -1522,12 +1577,7 @@ def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
         ConfigLaneUnavailable: config.yaml could not be read.  Callers must
             fail closed rather than treat this as "no lane".
     """
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-    except Exception as exc:
-        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
-    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    model_cfg = _read_raw_config_document().get("model")
     if not isinstance(model_cfg, dict):
         return None
     provider = str(model_cfg.get("provider") or "").strip()
@@ -1544,6 +1594,15 @@ def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
         api_mode="anthropic_messages",
         api_key=_config_lane_api_key(model_cfg.get("api_key")),
     )
+
+
+def is_on_configured_lane(provider: str, lane: ProxyLane) -> bool:
+    """True when *provider* IS the lane's provider (normalized comparison).
+
+    ``custom`` and ``custom:<slug>`` are different providers with different
+    endpoints, so they are deliberately NOT treated as equivalent.
+    """
+    return str(provider or "").strip().lower() == lane.provider.strip().lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1936,10 +1995,7 @@ def switch_model(
                 return ModelSwitchResult(
                     success=False,
                     is_global=is_global,
-                    error_message=(
-                        "config.yaml unreadable — refusing to route a Claude "
-                        f"model off the configured lane ({_cfg_exc})"
-                    ),
+                    error_message=f"{_CONFIG_UNREADABLE_MSG} ({_cfg_exc})",
                 )
 
         # --- Step d.7: configured-endpoint pin ---
@@ -1990,25 +2046,41 @@ def switch_model(
             if detected:
                 target_provider, new_model = detected
 
+        # Step e can turn a name that did not look Claude-family into one: a
+        # bare provider name resolves to that provider's DEFAULT model, so
+        # `/model anthropic` arrives here as claude-*.  The lane was not read
+        # for it above, and an unread lane would silently skip the invariant.
+        if _lane is None and is_claude_family_model(new_model):
+            try:
+                _lane = configured_anthropic_proxy_lane()
+            except ConfigLaneUnavailable as _cfg_exc:
+                return ModelSwitchResult(
+                    success=False,
+                    is_global=is_global,
+                    error_message=f"{_CONFIG_UNREADABLE_MSG} ({_cfg_exc})",
+                )
+
         # --- PATH B post-resolution invariant: Claude traffic never leaves
         #     the configured proxy lane ---
         # Step d.7 above only fires when NOTHING earlier resolved the name, so
         # on its own it is bypassable: MODEL_ALIASES maps bare `claude`/`opus`/
         # `sonnet`/`haiku` to vendor `anthropic`, the step-b cross-provider
         # fallback and the step-d aggregator catalog can each land a
-        # Claude-family name on a vendor-direct provider before d.7 is reached,
-        # and an OpenRouter-style `anthropic/claude-*` slug only reads as
-        # Claude-family once the vendor prefix is allowed.  This is the single
-        # chokepoint: whatever resolved it, a Claude name sitting on a
-        # vendor-direct provider goes back to the proxy.
+        # Claude-family name on another provider before d.7 is reached, and an
+        # OpenRouter-style `anthropic/claude-*` slug only reads as Claude-family
+        # once the vendor prefix is allowed.
+        #
+        # The test is "is this NOT the configured lane", not a list of known
+        # vendors: nous, opencode-*, openai-codex and other static catalogs also
+        # carry `claude-*` ids, so an allowlist of anthropic/openrouter would
+        # leave every one of them as an open bypass.  Judged on the RESOLVED
+        # `new_model` only — an alias that resolves to a non-Claude model is not
+        # Claude traffic, whatever the operator typed.
         if (
             endpoint_pin is None
             and _lane is not None
-            and target_provider.strip().lower() in VENDOR_DIRECT_CLAUDE_PROVIDERS
-            and (
-                is_claude_family_model(raw_input)
-                or is_claude_family_model(new_model)
-            )
+            and is_claude_family_model(new_model)
+            and not is_on_configured_lane(target_provider, _lane)
         ):
             if resolved_alias:
                 _resolved_by = f"alias '{resolved_alias}'"
@@ -2019,13 +2091,18 @@ def switch_model(
             else:
                 _resolved_by = "detect_provider_for_model"
             _pinned_from = target_provider
+            _kind = (
+                "vendor-direct"
+                if _pinned_from.strip().lower() in VENDOR_DIRECT_CLAUDE_PROVIDERS
+                else "off-lane"
+            )
             endpoint_pin = _lane
             target_provider = _lane.provider
             new_model = strip_anthropic_prefix(new_model)
             logger.info(
-                "Configured-lane invariant re-routed '%s' from %s to %s (%s); "
+                "Configured-lane invariant re-routed '%s' from %s %s to %s (%s); "
                 "resolved by %s",
-                new_model, _pinned_from, target_provider, _lane.base_url,
+                new_model, _kind, _pinned_from, target_provider, _lane.base_url,
                 _resolved_by,
             )
 

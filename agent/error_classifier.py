@@ -399,6 +399,9 @@ def _is_anthropic_model_404(error_msg: str, model: str) -> bool:
         return False
     requested = str(model or "").strip().strip("'\"").lower()
     if not requested:
+        # Decision (round-3 review): an unknown requested model does NOT make
+        # the rejection retryable — a 404 naming a model id is deterministic
+        # whether or not we can name what we asked for.
         return True
     return match.group(1).strip().strip("'\"").lower() == requested
 

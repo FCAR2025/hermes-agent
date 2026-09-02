@@ -16,8 +16,13 @@ already-poisoned sessions.  Overrides for other providers are left alone.
 
 Mirrors the harness in ``tests/gateway/test_session_model_override_persistence.py``.
 """
+import contextlib
 import logging
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 import pytest
 
@@ -56,6 +61,19 @@ _ANTHROPIC_LANE_CONFIG = {
         "api_mode": "anthropic_messages",
     }
 }
+
+
+@contextlib.contextmanager
+def _config_file(config):
+    """Point ``get_config_path()`` at a real config.yaml holding *config*.
+
+    The lane reads the raw document strictly, so the test must supply a file.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            yield path
 
 
 def _make_source() -> SessionSource:
@@ -105,7 +123,7 @@ def _rehydrate(store, session_key, *, config=_PROXY_LANE_CONFIG, lane_side_effec
         patch.object(model_switch, "configured_anthropic_proxy_lane",
                      side_effect=lane_side_effect)
         if lane_side_effect is not None
-        else patch("hermes_cli.config.load_config", return_value=config)
+        else _config_file(config)
     )
     with lane_patch, \
          patch(
@@ -248,6 +266,76 @@ def test_api_mode_alias_in_config_still_sanitizes(store_factory):
 
     store = store_factory()
     override = _rehydrate(store, session_key, config=cfg)
+
+    assert override["provider"] == "custom"
+    assert override["base_url"] == PROXY_BASE_URL
+
+
+# ── Round 3: any provider that is not the lane, not just `anthropic` ────
+
+NOUS_OVERRIDE = {
+    "model": "claude-opus-5",
+    "provider": "nous",
+    "base_url": "https://inference-api.nousresearch.com/v1",
+}
+
+
+def test_claude_on_a_non_anthropic_provider_is_sanitized(store_factory):
+    """nous/opencode-*/openai-codex catalogs list `claude-*` ids too, so a
+    vendor allowlist would leave each of them an open bypass."""
+    session_key = _seed(store_factory, NOUS_OVERRIDE)
+
+    store = store_factory()
+    override = _rehydrate(store, session_key)
+
+    assert override["provider"] == "custom"
+    assert override["base_url"] == PROXY_BASE_URL
+    assert store_factory().get_model_override(session_key) == {
+        "model": "claude-opus-5",
+        "provider": "custom",
+        "base_url": PROXY_BASE_URL,
+    }
+
+
+def test_non_claude_model_on_a_non_anthropic_provider_is_untouched(store_factory):
+    session_key = _seed(store_factory, CODEX_OVERRIDE)
+
+    store = store_factory()
+    override = _rehydrate(store, session_key)
+
+    assert override["provider"] == "openai-codex"
+    assert store_factory().get_model_override(session_key) == CODEX_OVERRIDE
+
+
+def test_override_already_on_the_lane_is_not_rewritten(store_factory):
+    on_lane = {
+        "model": "claude-fable-5-1",
+        "provider": "custom",
+        "base_url": PROXY_BASE_URL,
+    }
+    session_key = _seed(store_factory, on_lane)
+
+    store = store_factory()
+    override = _rehydrate(store, session_key)
+
+    assert override["provider"] == "custom"
+    assert store_factory().get_model_override(session_key) == on_lane
+
+
+def test_named_custom_slug_is_not_the_bare_custom_lane(store_factory):
+    """`custom` and `custom:<slug>` are different endpoints; a Claude override
+    parked on another custom provider still goes back to the configured one."""
+    session_key = _seed(
+        store_factory,
+        {
+            "model": "claude-opus-5",
+            "provider": "custom:some-other-proxy",
+            "base_url": "http://127.0.0.1:9999/v1",
+        },
+    )
+
+    store = store_factory()
+    override = _rehydrate(store, session_key)
 
     assert override["provider"] == "custom"
     assert override["base_url"] == PROXY_BASE_URL

@@ -26495,26 +26495,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "base_url": persisted.get("base_url"),
         }
         provider = persisted.get("provider")
-        # --- Sanitize a vendor-direct override back onto the configured lane ---
+        # --- Sanitize an off-lane override back onto the configured lane ---
         # A `/model claude-*` typed while the session sat off-lane could pin the
-        # session to api.anthropic.com (see the switch_model configured-lane
-        # invariant). Such an override was persisted and would rehydrate forever
-        # after a restart: Max-subscription traffic billed as API, and
-        # proxy-only aliases (`fable`) 404ing on every turn. Rewrite it to the
-        # configured proxy lane here so a gateway restart heals already-poisoned
-        # sessions.
+        # session to a provider that is not the configured proxy (see the
+        # switch_model configured-lane invariant). Such an override was
+        # persisted and would rehydrate forever after a restart:
+        # Max-subscription traffic billed as a vendor API, and proxy-only
+        # aliases (`fable`) 404ing on every turn. Rewrite it to the configured
+        # proxy lane here so a gateway restart heals already-poisoned sessions.
+        #
+        # The test is "not the configured lane", not a vendor allowlist:
+        # nous, opencode-* and openai-codex static catalogs carry `claude-*`
+        # ids too, so anything but the lane is a bypass.
         #
         # POLICY: this also migrates an override the operator chose explicitly
-        # with `/model <claude-model> --provider anthropic`. That is deliberate
-        # on this deployment — Claude traffic must never bill the vendor API,
+        # with `/model <claude-model> --provider <vendor>`. That is deliberate
+        # on this deployment — Claude traffic must never bill a vendor API,
         # and the configured proxy is the only sanctioned lane.
-        if str(provider or "").strip().lower() == "anthropic":
-            _lane = None
+        _sanitize_model = override.get("model")
+        _lane = None
+        _strip_prefix = None
+        if provider and _sanitize_model:
             try:
                 from hermes_cli.model_switch import (
                     ConfigLaneUnavailable,
                     configured_anthropic_proxy_lane,
                     is_claude_family_model,
+                    is_on_configured_lane,
                     strip_anthropic_prefix,
                 )
             except Exception:
@@ -26522,53 +26529,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Model-switch lane helpers unavailable; leaving persisted "
                     "override unchanged", exc_info=True,
                 )
-                is_claude_family_model = None
             else:
-                try:
-                    _lane = configured_anthropic_proxy_lane()
-                except ConfigLaneUnavailable as _cfg_exc:
-                    # Fail closed on the READ, not on the override: we cannot
-                    # prove where the configured lane points, so we neither
-                    # rewrite nor silently bless the vendor-direct pin.
-                    logger.warning(
-                        "config.yaml unreadable (%s) — leaving persisted /model "
-                        "override for session=%s on %s unchanged; it may be "
-                        "bypassing the configured proxy lane",
-                        _cfg_exc, session_key, provider,
-                    )
-                    is_claude_family_model = None
-            if (
-                _lane is not None
-                and is_claude_family_model is not None
-                and is_claude_family_model(override.get("model"))
-            ):
-                _old_provider, _old_base = provider, override.get("base_url")
-                provider = _lane.provider
-                override["provider"] = _lane.provider
-                override["base_url"] = _lane.base_url
-                override["model"] = strip_anthropic_prefix(override.get("model"))
-                try:
-                    store.set_model_override(
-                        session_key,
-                        {
-                            "model": override.get("model"),
-                            "provider": override.get("provider"),
-                            "base_url": override.get("base_url"),
-                        },
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to persist sanitized session model override",
-                        exc_info=True,
-                    )
-                logger.warning(
-                    "Sanitized persisted /model override for session=%s: "
-                    "%s@%s -> %s@%s (configured proxy lane; explicit "
-                    "--provider anthropic selections are migrated too: "
-                    "proxy-only policy)",
-                    session_key, _old_provider, _old_base,
-                    _lane.provider, _lane.base_url,
+                if is_claude_family_model(_sanitize_model):
+                    try:
+                        _lane = configured_anthropic_proxy_lane()
+                    except ConfigLaneUnavailable as _cfg_exc:
+                        # Fail closed on the READ, not on the override: we
+                        # cannot prove where the configured lane points, so we
+                        # neither rewrite nor silently bless the off-lane pin.
+                        _lane = None
+                        logger.warning(
+                            "config.yaml unreadable (%s) — leaving persisted "
+                            "/model override for session=%s on %s unchanged; it "
+                            "may be bypassing the configured proxy lane",
+                            _cfg_exc, session_key, provider,
+                        )
+                    else:
+                        if _lane is not None and is_on_configured_lane(
+                            provider, _lane
+                        ):
+                            _lane = None  # already on the lane, nothing to do
+                        else:
+                            _strip_prefix = strip_anthropic_prefix
+        if _lane is not None and _strip_prefix is not None:
+            _old_provider, _old_base = provider, override.get("base_url")
+            provider = _lane.provider
+            override["provider"] = _lane.provider
+            override["base_url"] = _lane.base_url
+            override["model"] = _strip_prefix(_sanitize_model)
+            try:
+                store.set_model_override(
+                    session_key,
+                    {
+                        "model": override.get("model"),
+                        "provider": override.get("provider"),
+                        "base_url": override.get("base_url"),
+                    },
                 )
+            except Exception:
+                logger.debug(
+                    "Failed to persist sanitized session model override",
+                    exc_info=True,
+                )
+            logger.warning(
+                "Sanitized persisted /model override for session=%s: "
+                "%s@%s -> %s@%s (configured proxy lane; explicit --provider "
+                "selections are migrated too: proxy-only policy)",
+                session_key, _old_provider, _old_base,
+                _lane.provider, _lane.base_url,
+            )
         if provider:
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
