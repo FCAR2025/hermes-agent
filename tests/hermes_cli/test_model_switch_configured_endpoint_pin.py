@@ -18,9 +18,13 @@ Hermetic: the whole resolution chain is mocked (no network), mirroring
 ``tests/hermes_cli/test_model_switch_configured_provider_routing.py``.
 """
 
+import contextlib
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.model_switch import (
     ConfigLaneUnavailable,
@@ -61,6 +65,50 @@ _ANTHROPIC_LANE_CONFIG = {
 _UNPINNED_BASE_URL = "http://resolved/v1"
 
 
+@contextlib.contextmanager
+def _config_file(config):
+    """Point ``get_config_path()`` at a real config.yaml holding *config*.
+
+    The lane does a STRICT read of the raw document (never ``load_config()``,
+    which falls back to defaults and would make an unreadable config look like
+    "no proxy lane"), so tests must supply a real file.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            yield path
+
+
+@contextlib.contextmanager
+def _missing_config_file():
+    """Point ``get_config_path()`` at a path that does not exist.
+
+    This is NOT the fail-closed case: a config that was never written declares
+    no lane, and refusing here would break every Claude switch on a fresh
+    install (and on the test suite's sandboxed HERMES_HOME).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "does-not-exist" / "config.yaml"
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            yield path
+
+
+@contextlib.contextmanager
+def _unreadable_config_file():
+    """Point ``get_config_path()`` at something that EXISTS but cannot be read.
+
+    A directory at the config path raises IsADirectoryError deterministically,
+    regardless of the running user's privileges (a chmod-000 file would not:
+    root ignores it).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.mkdir()
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            yield path
+
+
 def _runtime(**kwargs):
     """Stand-in for resolve_runtime_provider that echoes an explicit base_url."""
     return {
@@ -87,15 +135,16 @@ def _run_switch(
     is skipped (the incident's exact mechanism) rather than merely inert.
     ``alias_result`` is what ``resolve_alias`` returns — the (provider, model,
     alias) triple that lets step a land a name on a provider before the pin.
-    ``lane_side_effect`` replaces the lane lookup (used to inject a config read
-    failure at the seam; patching ``load_config`` itself is swallowed by the
-    broad ``except Exception`` around PATH B's moa lookup).
+    ``config`` is written to a real temp config.yaml that ``get_config_path()``
+    is pointed at, so the lane's strict read is genuinely exercised.
+    ``lane_side_effect`` replaces the lane lookup outright, for tests that need
+    a specific exception rather than a specific file.
     """
     lane_patch = (
         patch("hermes_cli.model_switch.configured_anthropic_proxy_lane",
               side_effect=lane_side_effect)
         if lane_side_effect is not None
-        else patch("hermes_cli.config.load_config", return_value=config)
+        else _config_file(config)
     )
     with patch("hermes_cli.model_switch.resolve_alias", return_value=alias_result), \
          patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
@@ -142,23 +191,64 @@ def test_is_claude_family_model_rejects_other_vendors():
 
 
 def test_configured_lane_requires_custom_anthropic_messages_endpoint():
-    with patch("hermes_cli.config.load_config", return_value=_PROXY_LANE_CONFIG):
+    with _config_file(_PROXY_LANE_CONFIG):
         assert configured_anthropic_proxy_lane() == ProxyLane(
             provider="custom",
             base_url=PROXY_BASE_URL,
             api_mode="anthropic_messages",
             api_key="",
         )
-    with patch("hermes_cli.config.load_config", return_value=_ANTHROPIC_LANE_CONFIG):
+    with _config_file(_ANTHROPIC_LANE_CONFIG):
         assert configured_anthropic_proxy_lane() is None
 
 
 def test_unreadable_config_is_not_no_lane():
-    """A config that cannot be READ must be distinguishable from a config that
-    declares no proxy — collapsing them fails OPEN on the bypass."""
-    with patch("hermes_cli.config.load_config", side_effect=OSError("boom")):
+    """A config that EXISTS but cannot be READ must be distinguishable from one
+    that declares no proxy — collapsing them fails OPEN on the bypass.
+
+    ``load_config()`` cannot express this: it falls back to DEFAULT_CONFIG on a
+    corrupt or unreadable file, so the lane does its own strict read.
+    """
+    with _unreadable_config_file():
         with pytest.raises(ConfigLaneUnavailable):
             configured_anthropic_proxy_lane()
+
+
+def test_missing_config_file_is_no_lane_not_a_refusal():
+    """A config that was never written declares no lane. Refusing here would
+    break every Claude switch on a fresh install — and the test suite's own
+    sandboxed HERMES_HOME, which holds no config.yaml."""
+    with _missing_config_file():
+        assert configured_anthropic_proxy_lane() is None
+
+
+def test_load_config_fallback_does_not_mask_an_unreadable_file():
+    """Pins WHY the strict read exists: the tolerant loader hands back a usable
+    dict for a config it could not read, which reads as "no proxy lane"."""
+    from hermes_cli.config import load_config
+
+    with _unreadable_config_file():
+        assert isinstance(load_config(), dict)   # tolerant: no raise
+        with pytest.raises(ConfigLaneUnavailable):
+            configured_anthropic_proxy_lane()    # strict: refuses
+
+
+def test_corrupt_yaml_is_unreadable_not_no_lane():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text("model: {unclosed: [1, 2\n  bad: : :\n", encoding="utf-8")
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            with pytest.raises(ConfigLaneUnavailable):
+                configured_anthropic_proxy_lane()
+
+
+def test_non_mapping_document_is_unreadable():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text("- just\n- a list\n", encoding="utf-8")
+        with patch("hermes_cli.config.get_config_path", return_value=path):
+            with pytest.raises(ConfigLaneUnavailable):
+                configured_anthropic_proxy_lane()
 
 
 @pytest.mark.parametrize(
@@ -167,7 +257,7 @@ def test_unreadable_config_is_not_no_lane():
 )
 def test_api_mode_spellings_all_mean_the_same_wire_protocol(spelling):
     cfg = {"model": {"provider": "custom", "base_url": PROXY_BASE_URL, "api_mode": spelling}}
-    with patch("hermes_cli.config.load_config", return_value=cfg):
+    with _config_file(cfg):
         lane = configured_anthropic_proxy_lane()
     assert lane is not None, spelling
     # Canonicalised on the way out, whatever the operator typed.
@@ -177,7 +267,7 @@ def test_api_mode_spellings_all_mean_the_same_wire_protocol(spelling):
 def test_chat_completions_lane_is_not_an_anthropic_proxy():
     cfg = {"model": {"provider": "custom", "base_url": PROXY_BASE_URL,
                      "api_mode": "chat_completions"}}
-    with patch("hermes_cli.config.load_config", return_value=cfg):
+    with _config_file(cfg):
         assert configured_anthropic_proxy_lane() is None
 
 
@@ -382,3 +472,95 @@ def test_env_reference_in_configured_api_key_is_expanded(monkeypatch):
     )
     assert result.success is True, result.error_message
     assert result.api_key == "sk-from-env"
+
+
+# ── Round 3: any provider that is not the lane, judged on the RESOLVED name ──
+
+def test_claude_resolved_onto_nous_is_pinned_back():
+    """Static catalogs for nous / opencode-* / openai-codex list `claude-*` ids
+    too. An {anthropic, openrouter} allowlist left each of them an open bypass;
+    the test is "not the configured lane", not a list of known vendors."""
+    result = _run_switch(
+        raw_input="opus",
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol-900k",
+        alias_result=("nous", "claude-opus-5", "opus"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+    assert result.new_model == "claude-opus-5"
+
+
+def test_claude_resolved_onto_another_custom_slug_is_pinned_back():
+    """`custom` and `custom:<slug>` are different endpoints — being "a custom
+    provider" is not the same as being THE configured lane."""
+    result = _run_switch(
+        raw_input="claude-opus-5",
+        current_provider="opencode-zen",
+        current_model="deepseek-v4-flash",
+        alias_result=("custom:some-other-proxy", "claude-opus-5", "opus"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+
+
+def test_switch_already_on_the_lane_is_not_re_pinned():
+    result = _run_switch(
+        raw_input="claude-fable-5-1",
+        current_provider="custom",
+        current_model="fable",
+        current_base_url=PROXY_BASE_URL,
+        alias_result=("custom", "claude-fable-5-1", "fable"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+
+
+def test_alias_resolving_to_a_non_claude_model_is_not_re_routed():
+    """Judged on the RESOLVED model, not on what the operator typed: a
+    `model_aliases` entry mapping `opus` to a non-Claude id on another provider
+    is that provider's traffic, not Claude traffic."""
+    result = _run_switch(
+        raw_input="opus",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        alias_result=("opencode-zen", "deepseek-v4-flash", "opus"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "opencode-zen"
+    assert result.new_model == "deepseek-v4-flash"
+    assert result.base_url != PROXY_BASE_URL
+
+
+def test_bare_provider_name_resolving_to_a_claude_default_is_pinned():
+    """`/model anthropic` is not Claude-family, but step e maps a bare provider
+    name to that provider's DEFAULT model — which is claude-*. The lane had not
+    been read for it, so without a top-up read the invariant was skipped."""
+    result = _run_switch(
+        raw_input="anthropic",
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol-900k",
+        detected=("anthropic", "claude-opus-4-5"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+    assert result.new_model == "claude-opus-4-5"
+
+
+def test_unreadable_config_file_refuses_to_route_a_claude_name():
+    """End-to-end fail-closed through the real strict read (no lane mock)."""
+    with _unreadable_config_file():
+        with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
+             patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
+             patch("hermes_cli.models.validate_requested_model", return_value=_ACCEPTED), \
+             patch("hermes_cli.models.detect_provider_for_model", return_value=None):
+            result = switch_model(
+                raw_input="claude-opus-5",
+                current_provider="openai-codex",
+                current_model="gpt-5.6-sol-900k",
+            )
+    assert result.success is False
+    assert "config.yaml unreadable" in result.error_message
