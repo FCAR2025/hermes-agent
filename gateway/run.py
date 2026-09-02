@@ -26497,25 +26497,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         provider = persisted.get("provider")
         # --- Sanitize a vendor-direct override back onto the configured lane ---
         # A `/model claude-*` typed while the session sat off-lane could pin the
-        # session to api.anthropic.com (see the switch_model step-d.7 pin). Such
-        # an override was persisted and would rehydrate forever after a restart:
-        # Max-subscription traffic billed as API, and proxy-only aliases
-        # (`fable`) 404ing on every turn. Rewrite it to the configured proxy lane
-        # here so a gateway restart heals already-poisoned sessions.
+        # session to api.anthropic.com (see the switch_model configured-lane
+        # invariant). Such an override was persisted and would rehydrate forever
+        # after a restart: Max-subscription traffic billed as API, and
+        # proxy-only aliases (`fable`) 404ing on every turn. Rewrite it to the
+        # configured proxy lane here so a gateway restart heals already-poisoned
+        # sessions.
+        #
+        # POLICY: this also migrates an override the operator chose explicitly
+        # with `/model <claude-model> --provider anthropic`. That is deliberate
+        # on this deployment — Claude traffic must never bill the vendor API,
+        # and the configured proxy is the only sanctioned lane.
         if str(provider or "").strip().lower() == "anthropic":
+            _lane = None
             try:
                 from hermes_cli.model_switch import (
+                    ConfigLaneUnavailable,
                     configured_anthropic_proxy_lane,
                     is_claude_family_model,
+                    strip_anthropic_prefix,
                 )
-                _lane = configured_anthropic_proxy_lane()
             except Exception:
-                _lane = None
-            if _lane is not None and is_claude_family_model(override.get("model")):
+                logger.debug(
+                    "Model-switch lane helpers unavailable; leaving persisted "
+                    "override unchanged", exc_info=True,
+                )
+                is_claude_family_model = None
+            else:
+                try:
+                    _lane = configured_anthropic_proxy_lane()
+                except ConfigLaneUnavailable as _cfg_exc:
+                    # Fail closed on the READ, not on the override: we cannot
+                    # prove where the configured lane points, so we neither
+                    # rewrite nor silently bless the vendor-direct pin.
+                    logger.warning(
+                        "config.yaml unreadable (%s) — leaving persisted /model "
+                        "override for session=%s on %s unchanged; it may be "
+                        "bypassing the configured proxy lane",
+                        _cfg_exc, session_key, provider,
+                    )
+                    is_claude_family_model = None
+            if (
+                _lane is not None
+                and is_claude_family_model is not None
+                and is_claude_family_model(override.get("model"))
+            ):
                 _old_provider, _old_base = provider, override.get("base_url")
-                provider = _lane[0]
-                override["provider"] = _lane[0]
-                override["base_url"] = _lane[1]
+                provider = _lane.provider
+                override["provider"] = _lane.provider
+                override["base_url"] = _lane.base_url
+                override["model"] = strip_anthropic_prefix(override.get("model"))
                 try:
                     store.set_model_override(
                         session_key,
@@ -26532,8 +26563,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 logger.warning(
                     "Sanitized persisted /model override for session=%s: "
-                    "%s@%s -> %s@%s (configured proxy lane)",
-                    session_key, _old_provider, _old_base, _lane[0], _lane[1],
+                    "%s@%s -> %s@%s (configured proxy lane; explicit "
+                    "--provider anthropic selections are migrated too: "
+                    "proxy-only policy)",
+                    session_key, _old_provider, _old_base,
+                    _lane.provider, _lane.base_url,
                 )
         if provider:
             # Re-resolve credentials for the persisted provider. On failure

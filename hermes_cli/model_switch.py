@@ -1436,45 +1436,114 @@ def _resolve_named_custom_model_id(
 # Configured-endpoint pin (Claude-family names must not leave the proxy lane)
 # ---------------------------------------------------------------------------
 
-_CLAUDE_FAMILY_RE = re.compile(r"^(claude|fable|opus|sonnet|haiku)([-_.:]|$)")
+class ConfigLaneUnavailable(RuntimeError):
+    """config.yaml could not be read at all.
+
+    Deliberately distinct from "no proxy lane is configured": the second is a
+    fact about the config, the first is the absence of one.  Collapsing them
+    made an unreadable config look like "operator routes Claude direct", which
+    fails OPEN on exactly the bypass this module exists to close.  Callers must
+    refuse to route a Claude-family name when they cannot prove where the
+    configured lane points.
+    """
+
+
+class ProxyLane(NamedTuple):
+    """The configured Anthropic-messages proxy lane."""
+
+    provider: str
+    base_url: str
+    api_mode: str
+    api_key: str
+
+
+# ``anthropic/claude-*`` is how aggregators (OpenRouter) spell the same models;
+# without the prefix allowance such a slug does not read as Claude-family at all.
+_CLAUDE_FAMILY_RE = re.compile(r"^(anthropic/)?(claude|fable|opus|sonnet|haiku)([-_.:]|$)")
+_ANTHROPIC_PREFIX_RE = re.compile(r"^anthropic/", re.IGNORECASE)
+
+# Spellings that all mean the Anthropic ``/v1/messages`` wire protocol.  The
+# operator writes whichever one they remember; the lane must not hinge on it.
+_ANTHROPIC_API_MODES: frozenset[str] = frozenset({
+    "anthropic_messages",
+    "anthropic-messages",
+    "anthropic",
+    "messages",
+})
+
+# Providers that serve Claude models on a metered vendor bill rather than
+# through the configured proxy.  A Claude-family name resolving to one of these
+# is the bypass, whatever resolved it.
+VENDOR_DIRECT_CLAUDE_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openrouter"})
 
 
 def is_claude_family_model(name: str) -> bool:
     """True when *name* is a Claude-family model id or proxy-only alias.
 
-    Matches ``claude-*``, ``fable``, ``opus``, ``sonnet``, ``haiku`` and their
-    suffixed forms.  Deliberately loose: the point is to catch names the
-    configured Anthropic-messages proxy serves, including aliases (``fable``)
-    that exist in no static catalog.
+    Matches ``claude-*``, ``fable``, ``opus``, ``sonnet``, ``haiku``, their
+    suffixed forms, and an optional ``anthropic/`` vendor prefix.  Deliberately
+    loose: the point is to catch names the configured Anthropic-messages proxy
+    serves, including aliases (``fable``) that exist in no static catalog.
     """
     return bool(_CLAUDE_FAMILY_RE.match(str(name or "").strip().lower()))
 
 
-def configured_anthropic_proxy_lane() -> Optional[tuple]:
-    """Return the configured default lane as ``(provider, base_url, api_mode)``.
+def strip_anthropic_prefix(name: str) -> str:
+    """Drop a leading ``anthropic/`` vendor prefix from *name*.
 
-    Only returns a lane when config.yaml ``model:`` declares a custom
+    The proxy serves bare ids; an aggregator slug would 404 against it.
+    """
+    return _ANTHROPIC_PREFIX_RE.sub("", str(name or "").strip())
+
+
+def _config_lane_api_key(raw: Any) -> str:
+    """Resolve ``model.api_key``, expanding a ``${ENV_VAR}`` reference.
+
+    Uses the same per-profile secret scope as the picker's ``key_env`` reads —
+    a raw ``os.environ`` read hands this profile whatever key the process env
+    holds, which under the multiplexed gateway can be another profile's.
+    """
+    key = str(raw or "").strip()
+    if key.startswith("${") and key.endswith("}"):
+        return _scoped_key_env(key[2:-1])
+    return key
+
+
+def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
+    """Return the configured default lane, or ``None`` when it is not a proxy.
+
+    A lane is returned only when config.yaml ``model:`` declares a custom
     Anthropic-messages endpoint (``provider: custom`` / ``custom:<slug>``,
-    non-empty ``base_url``, ``api_mode: anthropic_messages``) — i.e. the
-    operator routes Claude traffic through a proxy.  Any other shape, or any
-    config failure, returns ``None`` so callers become a no-op.
+    non-empty ``base_url``, an Anthropic-messages ``api_mode``) — i.e. the
+    operator routes Claude traffic through a proxy.  ``api_mode`` is returned
+    canonicalised to ``anthropic_messages``.
+
+    Raises:
+        ConfigLaneUnavailable: config.yaml could not be read.  Callers must
+            fail closed rather than treat this as "no lane".
     """
     try:
         from hermes_cli.config import load_config
-        model_cfg = load_config().get("model")
-        if not isinstance(model_cfg, dict):
-            return None
-        provider = str(model_cfg.get("provider") or "").strip()
-        base_url = str(model_cfg.get("base_url") or "").strip()
-        api_mode = str(model_cfg.get("api_mode") or "").strip()
-    except Exception:
+        cfg = load_config()
+    except Exception as exc:
+        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    if not isinstance(model_cfg, dict):
         return None
+    provider = str(model_cfg.get("provider") or "").strip()
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    api_mode = str(model_cfg.get("api_mode") or "").strip().lower()
     lowered = provider.lower()
     if lowered != "custom" and not lowered.startswith("custom:"):
         return None
-    if not base_url or api_mode != "anthropic_messages":
+    if not base_url or api_mode not in _ANTHROPIC_API_MODES:
         return None
-    return provider, base_url, api_mode
+    return ProxyLane(
+        provider=provider,
+        base_url=base_url,
+        api_mode="anthropic_messages",
+        api_key=_config_lane_api_key(model_cfg.get("api_key")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1544,9 +1613,9 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
-    # Step d.7 result: (provider, base_url, api_mode) of the configured proxy
-    # lane when a Claude-family name was pinned to it.  None = not pinned.
-    endpoint_pin: Optional[tuple] = None
+    # The configured proxy lane this switch was pinned to (by step d.7 or by
+    # the PATH B post-resolution invariant).  None = not pinned.
+    endpoint_pin: Optional[ProxyLane] = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1855,6 +1924,24 @@ def switch_model(
                     if isinstance(user_providers, dict) and target_provider in user_providers:
                         explicit_provider = target_provider
 
+        # --- Configured proxy lane, read once ---
+        # Both step d.7 and the post-resolution invariant below need it, and an
+        # unreadable config must fail CLOSED for a Claude-family name: we cannot
+        # prove where the configured lane points, so we must not route at all.
+        _lane: Optional[ProxyLane] = None
+        if is_claude_family_model(raw_input) or is_claude_family_model(new_model):
+            try:
+                _lane = configured_anthropic_proxy_lane()
+            except ConfigLaneUnavailable as _cfg_exc:
+                return ModelSwitchResult(
+                    success=False,
+                    is_global=is_global,
+                    error_message=(
+                        "config.yaml unreadable — refusing to route a Claude "
+                        f"model off the configured lane ({_cfg_exc})"
+                    ),
+                )
+
         # --- Step d.7: configured-endpoint pin ---
         # A Claude-family name typed on a session that drifted off the
         # configured lane (e.g. sitting on the codex fallback after a failover)
@@ -1864,23 +1951,24 @@ def switch_model(
         # `anthropic` and pinned the session to api.anthropic.com — bypassing
         # the proxy (Max subscription -> API billing), and proxy-only aliases
         # such as `fable` then 404 on every turn.
-        # Deliberately narrow: only when nothing earlier resolved the name, and
-        # only for Claude-family names.  `gpt-*` and friends are untouched.
+        # This step handles the UNRESOLVED case; the invariant after step e
+        # catches every name some earlier step already resolved.
         if (
-            not resolved_alias
+            _lane is not None
+            and not resolved_alias
             and not resolved_in_current_catalog
             and not config_routed
             and target_provider == current_provider
             and is_claude_family_model(new_model)
         ):
-            _lane = configured_anthropic_proxy_lane()
-            if _lane is not None:
-                endpoint_pin = _lane
-                target_provider = _lane[0]
-                logger.info(
-                    "Configured-endpoint pin routed '%s' to %s (%s)",
-                    new_model, target_provider, _lane[1],
-                )
+            endpoint_pin = _lane
+            target_provider = _lane.provider
+            # The proxy serves bare ids; an `anthropic/` slug would 404 on it.
+            new_model = strip_anthropic_prefix(new_model)
+            logger.info(
+                "Configured-endpoint pin routed '%s' to %s (%s)",
+                new_model, target_provider, _lane.base_url,
+            )
 
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
@@ -1901,6 +1989,45 @@ def switch_model(
             detected = detect_provider_for_model(new_model, current_provider)
             if detected:
                 target_provider, new_model = detected
+
+        # --- PATH B post-resolution invariant: Claude traffic never leaves
+        #     the configured proxy lane ---
+        # Step d.7 above only fires when NOTHING earlier resolved the name, so
+        # on its own it is bypassable: MODEL_ALIASES maps bare `claude`/`opus`/
+        # `sonnet`/`haiku` to vendor `anthropic`, the step-b cross-provider
+        # fallback and the step-d aggregator catalog can each land a
+        # Claude-family name on a vendor-direct provider before d.7 is reached,
+        # and an OpenRouter-style `anthropic/claude-*` slug only reads as
+        # Claude-family once the vendor prefix is allowed.  This is the single
+        # chokepoint: whatever resolved it, a Claude name sitting on a
+        # vendor-direct provider goes back to the proxy.
+        if (
+            endpoint_pin is None
+            and _lane is not None
+            and target_provider.strip().lower() in VENDOR_DIRECT_CLAUDE_PROVIDERS
+            and (
+                is_claude_family_model(raw_input)
+                or is_claude_family_model(new_model)
+            )
+        ):
+            if resolved_alias:
+                _resolved_by = f"alias '{resolved_alias}'"
+            elif resolved_in_current_catalog:
+                _resolved_by = "current-provider catalog"
+            elif config_routed:
+                _resolved_by = "configured-provider routing"
+            else:
+                _resolved_by = "detect_provider_for_model"
+            _pinned_from = target_provider
+            endpoint_pin = _lane
+            target_provider = _lane.provider
+            new_model = strip_anthropic_prefix(new_model)
+            logger.info(
+                "Configured-lane invariant re-routed '%s' from %s to %s (%s); "
+                "resolved by %s",
+                new_model, _pinned_from, target_provider, _lane.base_url,
+                _resolved_by,
+            )
 
     # =================================================================
     # COMMON PATH: Resolve credentials, normalize, get metadata
@@ -1928,25 +2055,28 @@ def switch_model(
     suppress_ollama_headers = False
 
     if endpoint_pin is not None:
-        # Step d.7 pin: the configured proxy lane's endpoint is authoritative.
-        # Never inherit the session's current (vendor-direct) base_url — that
-        # is exactly the bypass this step exists to close.
-        _pin_provider, _pin_base_url, _pin_api_mode = endpoint_pin
-        base_url = _pin_base_url
-        api_mode = _pin_api_mode
-        api_key = ""
-        try:
-            runtime = resolve_runtime_provider(
-                requested=_pin_provider,
-                explicit_base_url=_pin_base_url,
-                target_model=new_model,
-            )
-            api_key = runtime.get("api_key", "") or ""
-        except Exception:
-            logger.debug(
-                "Credential resolution failed for pinned lane %s (%s)",
-                _pin_provider, _pin_base_url, exc_info=True,
-            )
+        # Pinned lane: the configured proxy endpoint is authoritative.  Never
+        # inherit the session's current (vendor-direct) base_url — that is
+        # exactly the bypass the pin exists to close.
+        base_url = endpoint_pin.base_url
+        api_mode = endpoint_pin.api_mode
+        # The configured lane's own key wins: it is the credential that lane
+        # was set up with. Runtime resolution is the fallback, and only when
+        # both are empty does the keyless local-proxy default apply.
+        api_key = endpoint_pin.api_key
+        if not api_key:
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=endpoint_pin.provider,
+                    explicit_base_url=endpoint_pin.base_url,
+                    target_model=new_model,
+                )
+                api_key = runtime.get("api_key", "") or ""
+            except Exception:
+                logger.debug(
+                    "Credential resolution failed for pinned lane %s (%s)",
+                    endpoint_pin.provider, endpoint_pin.base_url, exc_info=True,
+                )
         if not api_key:
             api_key = "no-key-required"
     elif provider_changed or explicit_provider:
@@ -2072,7 +2202,9 @@ def switch_model(
                 pass
 
     # --- Direct alias override: use exact base_url from the alias if set ---
-    if resolved_alias:
+    # Skipped when a lane is pinned: the invariant above can fire on an
+    # alias-resolved name, and a DIRECT_ALIASES base_url would silently undo it.
+    if resolved_alias and endpoint_pin is None:
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:

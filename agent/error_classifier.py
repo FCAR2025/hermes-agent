@@ -382,7 +382,25 @@ _MODEL_NOT_FOUND_PATTERNS = [
 # phrase in _MODEL_NOT_FOUND_PATTERNS, so the generic-404 branch treated a
 # deterministic rejection as retryable and burned three attempts per turn
 # before failing over (2026-09-02: `/model fable` pinned to api.anthropic.com).
-_ANTHROPIC_MODEL_404_RE = re.compile(r"""\bmodel:\s*['\"]?[A-Za-z0-9._:/-]+""")
+_ANTHROPIC_MODEL_404_RE = re.compile(r"""\bmodel:\s*['\"]?([A-Za-z0-9._:/-]+)""")
+
+
+def _is_anthropic_model_404(error_msg: str, model: str) -> bool:
+    """True when a 404 body is Anthropic's "this model id does not exist".
+
+    When *model* is known, the id named in the body must BE that model: a body
+    naming some other id is about a different request (a proxy quoting an
+    upstream, a wrapped error) and must keep the generic-404 retry path.
+    """
+    if "not_found_error" not in error_msg:
+        return False
+    match = _ANTHROPIC_MODEL_404_RE.search(error_msg)
+    if match is None:
+        return False
+    requested = str(model or "").strip().strip("'\"").lower()
+    if not requested:
+        return True
+    return match.group(1).strip().strip("'\"").lower() == requested
 
 
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
@@ -1324,9 +1342,9 @@ def _classify_by_status(
                 retryable=False,
                 should_fallback=True,
             )
-        # Anthropic's ``not_found_error`` naming a model id: deterministic,
-        # so don't retry — fail over instead (see _ANTHROPIC_MODEL_404_RE).
-        if "not_found_error" in error_msg and _ANTHROPIC_MODEL_404_RE.search(error_msg):
+        # Anthropic's ``not_found_error`` naming the requested model id:
+        # deterministic, so don't retry — fail over instead.
+        if _is_anthropic_model_404(error_msg, model):
             return result_fn(
                 FailoverReason.model_not_found,
                 retryable=False,
