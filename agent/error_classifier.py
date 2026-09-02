@@ -10,6 +10,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
@@ -390,6 +391,18 @@ _404_RULES = (
     (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
 )
 
+_ANTHROPIC_MODEL_404_RE = re.compile(r"\bmodel:\s*['\"]?([A-Za-z0-9._:/-]+)")
+
+
+def _is_anthropic_model_404(error_msg: str, model: str) -> bool:
+    if "not_found_error" not in error_msg:
+        return False
+    match = _ANTHROPIC_MODEL_404_RE.search(error_msg)
+    if match is None:
+        return False
+    requested = str(model or "").strip().strip("'\"").lower()
+    return not requested or match.group(1).strip().strip("'\"").lower() == requested
+
 # 400 tail after the deterministic request-shape checks. Some providers return
 # model-not-found / rate-limit / billing as 400 instead of 404/429/402.
 _400_TAIL_RULES = _OVERFLOW_AS_5XX_RULES + (
@@ -632,6 +645,8 @@ def _status_403(c: _Ctx) -> Verdict:
 
 
 def _status_404(c: _Ctx) -> Verdict:
+    if _is_anthropic_model_404(c.msg, c.model):
+        return _V_MODEL_NOT_FOUND
     verdict = _first_match(c.msg, _404_RULES)
     if verdict is not None:
         return verdict
