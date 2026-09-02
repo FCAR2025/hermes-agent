@@ -20,9 +20,14 @@ Hermetic: the whole resolution chain is mocked (no network), mirroring
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import (
+    ConfigLaneUnavailable,
+    ProxyLane,
     configured_anthropic_proxy_lane,
     is_claude_family_model,
+    strip_anthropic_prefix,
     switch_model,
 )
 
@@ -73,13 +78,26 @@ def _run_switch(
     current_base_url="",
     config=_PROXY_LANE_CONFIG,
     detected=None,
+    alias_result=None,
+    lane_side_effect=None,
 ):
     """Drive ``switch_model`` with every external lookup patched out.
 
     ``detect_provider_for_model`` returns *detected* so a test can prove step e
     is skipped (the incident's exact mechanism) rather than merely inert.
+    ``alias_result`` is what ``resolve_alias`` returns — the (provider, model,
+    alias) triple that lets step a land a name on a provider before the pin.
+    ``lane_side_effect`` replaces the lane lookup (used to inject a config read
+    failure at the seam; patching ``load_config`` itself is swallowed by the
+    broad ``except Exception`` around PATH B's moa lookup).
     """
-    with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
+    lane_patch = (
+        patch("hermes_cli.model_switch.configured_anthropic_proxy_lane",
+              side_effect=lane_side_effect)
+        if lane_side_effect is not None
+        else patch("hermes_cli.config.load_config", return_value=config)
+    )
+    with patch("hermes_cli.model_switch.resolve_alias", return_value=alias_result), \
          patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
          patch(
              "hermes_cli.model_switch.normalize_model_for_provider",
@@ -89,7 +107,7 @@ def _run_switch(
          patch("hermes_cli.models.detect_provider_for_model", return_value=detected), \
          patch("hermes_cli.model_switch.get_model_info", return_value=None), \
          patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
-         patch("hermes_cli.config.load_config", return_value=config), \
+         lane_patch, \
          patch(
              "hermes_cli.runtime_provider.resolve_runtime_provider",
              side_effect=lambda **kw: _runtime(**kw),
@@ -125,13 +143,49 @@ def test_is_claude_family_model_rejects_other_vendors():
 
 def test_configured_lane_requires_custom_anthropic_messages_endpoint():
     with patch("hermes_cli.config.load_config", return_value=_PROXY_LANE_CONFIG):
-        assert configured_anthropic_proxy_lane() == (
-            "custom", PROXY_BASE_URL, "anthropic_messages",
+        assert configured_anthropic_proxy_lane() == ProxyLane(
+            provider="custom",
+            base_url=PROXY_BASE_URL,
+            api_mode="anthropic_messages",
+            api_key="",
         )
     with patch("hermes_cli.config.load_config", return_value=_ANTHROPIC_LANE_CONFIG):
         assert configured_anthropic_proxy_lane() is None
-    with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+
+
+def test_unreadable_config_is_not_no_lane():
+    """A config that cannot be READ must be distinguishable from a config that
+    declares no proxy — collapsing them fails OPEN on the bypass."""
+    with patch("hermes_cli.config.load_config", side_effect=OSError("boom")):
+        with pytest.raises(ConfigLaneUnavailable):
+            configured_anthropic_proxy_lane()
+
+
+@pytest.mark.parametrize(
+    "spelling", ["anthropic_messages", "anthropic-messages", "anthropic", "messages",
+                 "Anthropic_Messages", "  anthropic-messages  "],
+)
+def test_api_mode_spellings_all_mean_the_same_wire_protocol(spelling):
+    cfg = {"model": {"provider": "custom", "base_url": PROXY_BASE_URL, "api_mode": spelling}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        lane = configured_anthropic_proxy_lane()
+    assert lane is not None, spelling
+    # Canonicalised on the way out, whatever the operator typed.
+    assert lane.api_mode == "anthropic_messages"
+
+
+def test_chat_completions_lane_is_not_an_anthropic_proxy():
+    cfg = {"model": {"provider": "custom", "base_url": PROXY_BASE_URL,
+                     "api_mode": "chat_completions"}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
         assert configured_anthropic_proxy_lane() is None
+
+
+def test_strip_anthropic_prefix():
+    assert strip_anthropic_prefix("anthropic/claude-opus-5") == "claude-opus-5"
+    assert strip_anthropic_prefix("Anthropic/claude-opus-5") == "claude-opus-5"
+    assert strip_anthropic_prefix("fable") == "fable"
+    assert strip_anthropic_prefix("openrouter/anthropic/claude") == "openrouter/anthropic/claude"
 
 
 # ── (a) the incident: codex fallback + /model claude-opus-5 ────────────
@@ -197,3 +251,134 @@ def test_no_op_when_configured_lane_is_not_a_custom_proxy():
     assert result.success is True, result.error_message
     assert result.target_provider == "openai-codex"
     assert result.base_url != PROXY_BASE_URL
+
+
+# ── Round 2: the invariant, for names an EARLIER step already resolved ──
+#
+# Step d.7 alone is bypassable — it only fires when nothing resolved the name.
+# These pin the post-resolution invariant at the end of PATH B.
+
+def test_bare_claude_alias_from_anthropic_session_is_pinned_back():
+    """MODEL_ALIASES maps bare `claude` to vendor `anthropic`, so step a
+    resolves it and step d.7 never runs. The invariant must still catch it."""
+    result = _run_switch(
+        raw_input="claude",
+        current_provider="anthropic",
+        current_model="claude-opus-5",
+        current_base_url="https://api.anthropic.com",
+        alias_result=("anthropic", "claude-opus-4-5", "claude"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_openrouter_style_vendor_slug_is_pinned_and_prefix_stripped():
+    """`anthropic/claude-opus-5` does not read as Claude-family without the
+    vendor-prefix allowance; the proxy also needs the bare id."""
+    result = _run_switch(
+        raw_input="anthropic/claude-opus-5",
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol-900k",
+        detected=("anthropic", "anthropic/claude-opus-5"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+    assert result.new_model == "claude-opus-5"
+
+
+def test_claude_resolved_onto_openrouter_is_pinned_back():
+    """OpenRouter serves Claude on a metered vendor bill — same bypass class."""
+    result = _run_switch(
+        raw_input="claude-opus-5",
+        current_provider="openrouter",
+        current_model="anthropic/claude-sonnet-4",
+        alias_result=("openrouter", "anthropic/claude-opus-5", "opus"),
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom"
+    assert result.base_url == PROXY_BASE_URL
+    assert result.new_model == "claude-opus-5"
+
+
+def test_non_claude_name_on_anthropic_session_is_left_alone():
+    """The invariant keys on the MODEL, not on the session's provider."""
+    result = _run_switch(
+        raw_input="gpt-5.6-sol",
+        current_provider="anthropic",
+        current_model="claude-opus-5",
+        current_base_url="https://api.anthropic.com",
+        detected=None,
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "anthropic"
+    assert result.base_url != PROXY_BASE_URL
+
+
+def test_unreadable_config_refuses_to_route_a_claude_name():
+    """Fail CLOSED: we cannot prove where the configured lane points."""
+    result = _run_switch(
+        raw_input="claude-opus-5",
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol-900k",
+        lane_side_effect=ConfigLaneUnavailable("permission denied"),
+    )
+    assert result.success is False
+    assert "config.yaml unreadable" in result.error_message
+    assert "refusing to route a Claude model off the configured lane" in result.error_message
+
+
+def test_unreadable_config_does_not_block_a_non_claude_name():
+    """The lane is only consulted for Claude-family names, so a gpt switch on
+    an unreadable config behaves exactly as before."""
+    result = _run_switch(
+        raw_input="gpt-5.6-sol",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        lane_side_effect=ConfigLaneUnavailable("permission denied"),
+    )
+    assert result.success is True, result.error_message
+    assert result.new_model == "gpt-5.6-sol"
+
+
+def test_configured_lane_api_key_is_used():
+    cfg = {
+        "model": {
+            "provider": "custom",
+            "base_url": PROXY_BASE_URL,
+            "api_mode": "anthropic_messages",
+            "api_key": "sk-proxy-lane-key",
+        }
+    }
+    result = _run_switch(
+        raw_input="fable",
+        current_provider="anthropic",
+        current_model="claude-opus-5",
+        current_base_url="https://api.anthropic.com",
+        config=cfg,
+    )
+    assert result.success is True, result.error_message
+    assert result.api_key == "sk-proxy-lane-key"
+    assert result.base_url == PROXY_BASE_URL
+
+
+def test_env_reference_in_configured_api_key_is_expanded(monkeypatch):
+    monkeypatch.setenv("PROXY_LANE_KEY", "sk-from-env")
+    cfg = {
+        "model": {
+            "provider": "custom",
+            "base_url": PROXY_BASE_URL,
+            "api_mode": "anthropic_messages",
+            "api_key": "${PROXY_LANE_KEY}",
+        }
+    }
+    result = _run_switch(
+        raw_input="fable",
+        current_provider="anthropic",
+        current_model="claude-opus-5",
+        config=cfg,
+    )
+    assert result.success is True, result.error_message
+    assert result.api_key == "sk-from-env"

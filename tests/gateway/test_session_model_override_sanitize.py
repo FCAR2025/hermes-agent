@@ -16,6 +16,7 @@ already-poisoned sessions.  Overrides for other providers are left alone.
 
 Mirrors the harness in ``tests/gateway/test_session_model_override_persistence.py``.
 """
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -95,10 +96,18 @@ def _make_runner(store):
     return runner
 
 
-def _rehydrate(store, session_key, *, config=_PROXY_LANE_CONFIG):
+def _rehydrate(store, session_key, *, config=_PROXY_LANE_CONFIG, lane_side_effect=None):
     """Simulated restart: fresh runner, empty in-memory overrides."""
+    from hermes_cli import model_switch
+
     runner = _make_runner(store)
-    with patch("hermes_cli.config.load_config", return_value=config), \
+    lane_patch = (
+        patch.object(model_switch, "configured_anthropic_proxy_lane",
+                     side_effect=lane_side_effect)
+        if lane_side_effect is not None
+        else patch("hermes_cli.config.load_config", return_value=config)
+    )
+    with lane_patch, \
          patch(
              "gateway.run._resolve_runtime_agent_kwargs_for_provider",
              return_value={
@@ -182,3 +191,63 @@ def test_non_claude_model_on_anthropic_is_untouched(store_factory):
 
     assert override["provider"] == "anthropic"
     assert override["base_url"] == "https://api.anthropic.com"
+
+
+def test_unreadable_config_leaves_the_override_alone(store_factory, caplog):
+    """Fail closed on the READ: we cannot prove where the configured lane
+    points, so we neither rewrite the override nor bless the vendor-direct pin.
+    The operator gets a WARNING instead of silence."""
+    from hermes_cli.model_switch import ConfigLaneUnavailable
+
+    session_key = _seed(store_factory, POISONED_OVERRIDE)
+
+    store = store_factory()
+    with caplog.at_level(logging.WARNING):
+        override = _rehydrate(
+            store, session_key,
+            lane_side_effect=ConfigLaneUnavailable("permission denied"),
+        )
+
+    assert override["provider"] == "anthropic"
+    assert override["base_url"] == "https://api.anthropic.com"
+    assert store_factory().get_model_override(session_key) == POISONED_OVERRIDE
+    assert any(
+        "config.yaml unreadable" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_vendor_slug_override_is_pinned_and_prefix_stripped(store_factory):
+    """A persisted `anthropic/claude-*` slug must reach the proxy as a bare id."""
+    session_key = _seed(
+        store_factory,
+        {
+            "model": "anthropic/claude-opus-5",
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+        },
+    )
+
+    store = store_factory()
+    override = _rehydrate(store, session_key)
+
+    assert override["model"] == "claude-opus-5"
+    assert override["provider"] == "custom"
+    assert override["base_url"] == PROXY_BASE_URL
+
+
+def test_api_mode_alias_in_config_still_sanitizes(store_factory):
+    """The lane must not hinge on which api_mode spelling the operator used."""
+    session_key = _seed(store_factory, POISONED_OVERRIDE)
+    cfg = {
+        "model": {
+            "provider": "custom",
+            "base_url": PROXY_BASE_URL,
+            "api_mode": "anthropic-messages",
+        }
+    }
+
+    store = store_factory()
+    override = _rehydrate(store, session_key, config=cfg)
+
+    assert override["provider"] == "custom"
+    assert override["base_url"] == PROXY_BASE_URL

@@ -70,3 +70,43 @@ def test_not_found_error_without_model_id_stays_retryable():
     )
     assert result.reason == FailoverReason.unknown
     assert result.retryable is True
+
+
+def test_body_naming_a_different_model_is_not_our_rejection():
+    """A 404 body naming some OTHER id is about a different request (a proxy
+    quoting an upstream, a wrapped error) — it must keep the generic retry
+    path rather than be reported as "your model does not exist"."""
+    result = classify_api_error(
+        MockAPIError(LIVE_404, status_code=404),
+        provider="anthropic",
+        model="claude-opus-5",
+    )
+    assert result.reason == FailoverReason.unknown
+    assert result.retryable is True
+
+
+def test_model_id_match_is_case_insensitive():
+    result = classify_api_error(
+        MockAPIError(
+            "Error code: 404 - {'type': 'error', 'error': {'type': "
+            "'not_found_error', 'message': 'model: Claude-Fable-5-1'}}",
+            status_code=404,
+        ),
+        provider="anthropic",
+        model="CLAUDE-FABLE-5-1",
+    )
+    assert result.reason == FailoverReason.model_not_found
+    assert result.retryable is False
+
+
+def test_unknown_requested_model_still_classifies_on_the_body_alone():
+    """When the caller passes no model there is nothing to compare against, so
+    the body's own signal stands."""
+    result = classify_api_error(
+        MockAPIError(LIVE_404, status_code=404),
+        provider="anthropic",
+        model="",
+    )
+    assert result.reason == FailoverReason.model_not_found
+    assert result.retryable is False
+    assert result.should_fallback is True
