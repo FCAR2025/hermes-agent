@@ -53,6 +53,7 @@ from functools import wraps
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -1537,9 +1538,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        self._systemd_socket_activation: bool = _coerce_request_bool(
+            extra.get("systemd_socket_activation"), default=False
+        )
+        configured_fd_name = extra.get("systemd_fd_name", "")
+        self._systemd_fd_name: str = (
+            configured_fd_name if isinstance(configured_fd_name, str) else ""
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
-        self._site: Optional["web.TCPSite"] = None
+        self._site: Optional["web.BaseSite"] = None
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -8436,6 +8444,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return False
 
+        activated_socket = None
+        if self._systemd_socket_activation:
+            try:
+                activated_socket = self._systemd_activated_socket()
+            except Exception as exc:
+                self._set_fatal_error(
+                    "api_server_systemd_socket_invalid",
+                    "Invalid systemd socket activation for API server.",
+                    retryable=False,
+                )
+                logger.error(
+                    "[%s] Refusing systemd socket activation: %s",
+                    self.name,
+                    type(exc).__name__,
+                )
+                return False
+
         try:
             mws = [
                 mw
@@ -8514,19 +8539,29 @@ class APIServerAdapter(BasePlatformAdapter):
             #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
             #     (a second live listener needs SO_REUSEPORT, never set), so
             #     keep the default (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner,
-                self._host,
-                self._port,
-                reuse_address=False if sys.platform == "darwin" else None,
-            )
+            if activated_socket is not None:
+                self._site = web.SockSite(self._runner, activated_socket)
+            else:
+                self._site = web.TCPSite(
+                    self._runner,
+                    self._host,
+                    self._port,
+                    reuse_address=False if sys.platform == "darwin" else None,
+                )
             try:
                 await self._site.start()
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                if activated_socket is not None:
+                    activated_socket.close()
+                    self._set_fatal_error(
+                        "api_server_systemd_socket_invalid",
+                        "Invalid systemd socket activation for API server.",
+                        retryable=False,
+                    )
+                elif getattr(exc, "errno", None) == errno.EADDRINUSE:
                     # A port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
                     # its lifetime. A bare ``return False`` makes the
@@ -8560,8 +8595,38 @@ class APIServerAdapter(BasePlatformAdapter):
             return True
 
         except Exception as e:
+            if activated_socket is not None:
+                activated_socket.close()
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    def _systemd_activated_socket(self) -> socket.socket:
+        """Validate and duplicate systemd's single inherited IPv4 listener."""
+        if (
+            sys.platform != "linux"
+            or not self._systemd_fd_name
+            or os.environ.get("LISTEN_PID") != str(os.getpid())
+            or os.environ.get("LISTEN_FDS") != "1"
+            or os.environ.get("LISTEN_FDNAMES") != self._systemd_fd_name
+        ):
+            raise ValueError("invalid activation metadata")
+
+        inherited = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            address = inherited.getsockname()
+            if (
+                inherited.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                != socket.SOCK_STREAM
+                or inherited.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+                or not isinstance(address, tuple)
+                or len(address) != 2
+                or address != (self._host, self._port)
+            ):
+                raise ValueError("inherited descriptor does not match configured listener")
+            return inherited
+        except Exception:
+            inherited.close()
+            raise
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.
