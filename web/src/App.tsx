@@ -35,6 +35,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  LogOut,
   Menu,
   MessageSquare,
   Package,
@@ -107,6 +108,8 @@ import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import { DashboardSessionProvider } from "@/contexts/DashboardSessionProvider";
+import { useDashboardSession } from "@/contexts/dashboard-session-context";
 
 function RouteFallback({ label = "Loading…" }: { label?: string }) {
   return (
@@ -369,10 +372,197 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
+const PLUGIN_SURFACE_RE = /^plugin:([a-z0-9][a-z0-9_-]{0,63})$/;
+
+function AccessDenied() {
+  return (
+    <main className="flex h-dvh items-center justify-center bg-background-base text-text-primary">
+      <div role="alert" className="text-sm text-muted-foreground">
+        Access denied
+      </div>
+    </main>
+  );
+}
+
+function PluginWorkspaceShell({
+  manifest,
+  displayName,
+  backToHermes,
+  showLogout,
+  children,
+}: {
+  manifest: PluginManifest;
+  displayName: string;
+  backToHermes: boolean;
+  showLogout: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary">
+      <header className="flex min-h-14 shrink-0 items-center justify-between border-b border-current/20 px-4">
+        <Typography className="font-bold uppercase tracking-[0.08em] text-midground">
+          {manifest.label}
+        </Typography>
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          {backToHermes && <NavLink to="/sessions">Back to Hermes</NavLink>}
+          <span>{displayName}</span>
+          {showLogout && (
+            <button
+              type="button"
+              onClick={() => void api.logout()}
+              aria-label="Log out"
+              className="rounded p-2 transition-colors hover:bg-current/10 hover:text-foreground"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      </header>
+      <main className="min-h-0 flex-1 overflow-auto p-3 sm:p-6">
+        {children}
+      </main>
+    </div>
+  );
+}
+
+function ScopedPluginShell({
+  pluginId,
+  displayName,
+}: {
+  pluginId: string;
+  displayName: string;
+}) {
+  const { manifests, loading } = usePlugins();
+  const manifest = manifests.find((candidate) => candidate.name === pluginId);
+
+  if (loading) return <RouteFallback label="Loading dashboard…" />;
+  if (!manifest || manifests.some((candidate) => candidate.name !== pluginId)) {
+    return <AccessDenied />;
+  }
+
+  const pluginPath = manifest.tab.override ?? manifest.tab.path;
+  if (!pluginPath.startsWith("/") || pluginPath.startsWith("//")) {
+    return <AccessDenied />;
+  }
+
+  return (
+    <PluginWorkspaceShell
+      manifest={manifest}
+      displayName={displayName}
+      backToHermes={false}
+      showLogout
+    >
+      <Routes>
+        <Route path={pluginPath} element={<PluginPage name={pluginId} />} />
+        <Route path="*" element={<Navigate to={pluginPath} replace />} />
+      </Routes>
+    </PluginWorkspaceShell>
+  );
+}
+
+function ScopedPluginBootstrap({
+  pluginId,
+  displayName,
+}: {
+  pluginId: string;
+  displayName: string;
+}) {
+  const [cacheCleared] = useState(() => {
+    try {
+      sessionStorage.removeItem("hermes:plugin-manifests");
+    } catch {
+      // Storage may be unavailable; the server response is still filtered.
+    }
+    return true;
+  });
+
+  if (!cacheCleared) return <RouteFallback label="Loading dashboard…" />;
+  return <ScopedPluginShell pluginId={pluginId} displayName={displayName} />;
+}
+
+function FullDashboardPresentationGate({
+  displayName,
+  showLogout,
+}: {
+  displayName: string;
+  showLogout: boolean;
+}) {
+  const { pathname } = useLocation();
+  const { manifests, loading } = usePlugins();
+  if (loading) return <RouteFallback label="Loading dashboard…" />;
+
+  const normalizedPath = pathname.replace(/\/$/, "") || "/";
+  const workspaceManifest = manifests.find((manifest) => {
+    if (manifest.presentation !== "workspace") return false;
+    const pluginPath = manifest.tab.override ?? manifest.tab.path;
+    if (!pluginPath.startsWith("/") || pluginPath.startsWith("//")) {
+      return false;
+    }
+    return (pluginPath.replace(/\/$/, "") || "/") === normalizedPath;
+  });
+
+  if (workspaceManifest) {
+    return (
+      <PluginWorkspaceShell
+        manifest={workspaceManifest}
+        displayName={displayName}
+        backToHermes
+        showLogout={showLogout}
+      >
+        <PluginPage name={workspaceManifest.name} />
+      </PluginWorkspaceShell>
+    );
+  }
+
+  return <FullDashboardApp manifests={manifests} pluginsLoading={loading} />;
+}
+
+function DashboardAppGate() {
+  const { gated, loading, error, session } = useDashboardSession();
+  if (!gated) {
+    return (
+      <FullDashboardPresentationGate
+        displayName="Local dashboard"
+        showLogout={false}
+      />
+    );
+  }
+  if (loading) return <RouteFallback label="Verifying access…" />;
+  if (error || session === null) return <AccessDenied />;
+  const displayName = session.display_name || session.email || session.user_id;
+  if (session.surface === "dashboard") {
+    return (
+      <FullDashboardPresentationGate
+        displayName={displayName}
+        showLogout
+      />
+    );
+  }
+
+  const match = PLUGIN_SURFACE_RE.exec(session.surface);
+  if (!match) return <AccessDenied />;
+  return (
+    <ScopedPluginBootstrap pluginId={match[1]} displayName={displayName} />
+  );
+}
+
 export default function App() {
+  return (
+    <DashboardSessionProvider>
+      <DashboardAppGate />
+    </DashboardSessionProvider>
+  );
+}
+
+function FullDashboardApp({
+  manifests,
+  pluginsLoading,
+}: {
+  manifests: PluginManifest[];
+  pluginsLoading: boolean;
+}) {
   const { t } = useI18n();
   const { pathname } = useLocation();
-  const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
