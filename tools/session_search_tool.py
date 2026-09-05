@@ -963,6 +963,14 @@ def _session_search_impl(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
+    from gateway.session_context import current_profile_only, get_session_env
+
+    isolated_profile = (
+        str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+        if current_profile_only()
+        else ""
+    )
+
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
     # always strip the prefix off the id, and adopt the embedded profile only
@@ -974,6 +982,27 @@ def _session_search_impl(
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+
+    link_profile = profile
+    if isolated_profile:
+        requested_profile = str(profile or "").strip()
+        if requested_profile:
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+
+                requested_profile = normalize_profile_name(requested_profile)
+            except Exception:
+                return tool_error(
+                    "Session search is restricted to the current profile.",
+                    success=False,
+                )
+            if requested_profile != isolated_profile:
+                return tool_error(
+                    "Session search is restricted to the current profile.",
+                    success=False,
+                )
+        profile = None
+        link_profile = isolated_profile
 
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
@@ -1002,14 +1031,14 @@ def _session_search_impl(
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid, link_profile=profile)
+        result = _read_session(db, sid, link_profile=link_profile)
         if json.loads(result).get("success"):
             return result
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
+        located, owner = (None, None) if isolated_profile else _locate_session_db(sid)
         if located is not None:
             try:
                 found = json.loads(_read_session(located, sid, link_profile=owner))
@@ -1030,7 +1059,7 @@ def _session_search_impl(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(db, limit, current_session_id, link_profile=link_profile)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -1058,7 +1087,7 @@ def _session_search_impl(
         sort=sort_norm,
         detail=detail_norm,
         current_session_id=current_session_id,
-        link_profile=profile,
+        link_profile=link_profile,
     )
 
 
@@ -1080,6 +1109,15 @@ def session_search(
     detail: str = "adaptive",
 ) -> str:
     """Run session search and close databases opened by this invocation."""
+    from gateway.session_context import current_profile_only, get_session_env
+
+    if current_profile_only() and not str(
+        get_session_env("HERMES_SESSION_PROFILE", "") or ""
+    ).strip():
+        return tool_error(
+            "Session search requires a bound profile scope under the current-profile-only policy.",
+            success=False,
+        )
     owned_dbs: List[Any] = []
     if db is None:
         try:

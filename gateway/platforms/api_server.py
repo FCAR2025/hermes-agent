@@ -1508,6 +1508,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._current_profile_only: bool = self._resolve_current_profile_only()
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
         # multiple clients on different backends.
@@ -1774,6 +1775,35 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return default
         return max(0, value)
+
+    @staticmethod
+    def _resolve_current_profile_only() -> bool:
+        """Read the opt-in current-profile-only API session policy."""
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            return cfg_get(
+                load_config(),
+                "gateway",
+                "api_server",
+                "current_profile_only",
+                default=False,
+            ) is True
+        except Exception:
+            return False
+
+    def _bound_api_session_profile(self, request_profile: Optional[str]) -> str:
+        """Return the trusted profile identity to bind into an API agent turn."""
+        if request_profile:
+            return request_profile
+        if not self._current_profile_only:
+            return ""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name()
+        except Exception:
+            return ""
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -7136,6 +7166,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        profile: str = "",
+        current_profile_only: bool = False,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7161,6 +7193,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
+            profile=profile,
+            current_profile_only=current_profile_only,
             async_delivery=False,
             cron_session="",
         )
@@ -7232,6 +7266,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
+                bound_profile = self._bound_api_session_profile(request_profile)
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -7240,6 +7275,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     browser_control_transport_family=(
                         request_browser_control_transport_family
                     ),
+                    profile=bound_profile,
+                    current_profile_only=self._current_profile_only,
                 )
                 agent = None
                 try:
@@ -7774,6 +7811,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                 browser_control_transport_family=(
                                     request_browser_control_transport_family
                                 ),
+                                profile=self._bound_api_session_profile(
+                                    request_profile
+                                ),
+                                current_profile_only=self._current_profile_only,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
@@ -7977,7 +8018,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+
+        payload = dict(status)
+        payload.pop("pending_approval", None)
+        approval_session_key = self._run_approval_sessions.get(run_id)
+        if approval_session_key:
+            from gateway.run import _redact_approval_command
+            from tools.approval import get_pending_gateway_approval
+
+            pending = get_pending_gateway_approval(approval_session_key)
+            if pending is not None:
+                smart_denied = bool(pending.get("smart_denied"))
+                payload["status"] = "waiting_for_approval"
+                payload["pending_approval"] = {
+                    "request_id": str(pending.get("request_id", "")),
+                    "command": _redact_approval_command(
+                        pending.get("command")
+                    )[:4096],
+                    "description": _redact_api_error_text(
+                        pending.get("description", ""), limit=1024
+                    ),
+                    "smart_denied": smart_denied,
+                    "choices": _approval_event_choices(
+                        smart_denied=smart_denied,
+                        allow_permanent=(
+                            pending.get("allow_permanent") is not False
+                        ),
+                    ),
+                }
+        return web.json_response(payload)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -8077,13 +8146,38 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        has_request_id = "request_id" in body
+        request_id = body.get("request_id") if has_request_id else None
+        if has_request_id and (
+            not isinstance(request_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval request_id; expected 32 lowercase hex characters",
+                    code="invalid_approval_request_id",
+                ),
+                status=400,
+            )
+        if has_request_id and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "request_id cannot be combined with resolve_all",
+                    code="conflicting_approval_selection",
+                ),
+                status=400,
+            )
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                get_pending_gateway_approval,
+                resolve_gateway_approval,
+            )
 
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=request_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -8098,7 +8192,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        remaining = get_pending_gateway_approval(approval_session_key)
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval" if remaining is not None else "running",
+            last_event="approval.responded",
+        )
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
@@ -8108,6 +8207,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
+                    **({"request_id": request_id} if request_id else {}),
                 })
             except Exception:
                 pass
@@ -8117,6 +8217,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            **({"request_id": request_id} if request_id else {}),
         })
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":

@@ -17,12 +17,13 @@ binds.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Awaitable, Callable
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from hermes_cli.dashboard_auth import list_session_providers
+from hermes_cli.dashboard_auth import list_providers, list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
@@ -40,6 +41,8 @@ from hermes_cli.dashboard_auth.cookies import (
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
+
+_PLUGIN_SURFACE_RE = re.compile(r"^plugin:([a-z0-9][a-z0-9_-]{0,63})$")
 
 # Prefixes that bypass the auth gate. Match via ``path == prefix`` or
 # ``path.startswith(prefix)`` — so ``/assets/`` (with trailing slash)
@@ -84,6 +87,158 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
+
+
+def _restricted_surface_response(error: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": error,
+            "detail": "This session is not authorized for that dashboard surface.",
+        },
+        status_code=403,
+    )
+
+
+def _has_ambiguous_path_encoding(request: Request) -> bool:
+    """Reject path spellings that could be normalized differently downstream."""
+    raw = request.scope.get("raw_path", b"")
+    if not isinstance(raw, bytes):
+        return True
+    raw_path = raw.split(b"?", 1)[0].lower()
+    if any(token in raw_path for token in (b"%2e", b"%2f", b"%5c")):
+        return True
+    path = request.url.path
+    if "\\" in path or "//" in path:
+        return True
+    return any(segment in {".", ".."} for segment in path.split("/"))
+
+
+def _is_registered_provider_public_auth_path(request: Request) -> bool:
+    """Match a trusted provider's validated, exact pre-login plugin path."""
+    if _has_ambiguous_path_encoding(request):
+        return False
+
+    request_path = request.url.path
+    for provider in list_providers():
+        provider_name = getattr(provider, "name", None)
+        if (
+            not isinstance(provider_name, str)
+            or _PLUGIN_SURFACE_RE.fullmatch(f"plugin:{provider_name}") is None
+        ):
+            continue
+        try:
+            declared = provider.public_auth_paths
+        except Exception:
+            continue
+        if not isinstance(declared, tuple):
+            continue
+
+        required_prefix = f"/api/plugins/{provider_name}/auth/"
+        valid_paths: list[str] = []
+        malformed = False
+        for path in declared:
+            if (
+                not isinstance(path, str)
+                or not path.startswith(required_prefix)
+                or path == required_prefix
+                or "%" in path
+                or "*" in path
+                or "?" in path
+                or "#" in path
+                or "\\" in path
+                or "//" in path
+                or any(
+                    segment in {"", ".", ".."}
+                    for segment in path[1:].split("/")
+                )
+            ):
+                malformed = True
+                break
+            valid_paths.append(path)
+        if not malformed and request_path in valid_paths:
+            return True
+    return False
+
+
+def _surface_denial(request: Request, session) -> Response | None:
+    """Return a denial for non-dashboard sessions outside their plugin.
+
+    ``dashboard`` is the backwards-compatible full-authority surface. A
+    plugin surface is accepted only when its id uses the closed grammar and
+    the running dashboard has registered a matching plugin manifest.
+    """
+    surface = getattr(session, "surface", None)
+    if surface == "dashboard":
+        return None
+    if not isinstance(surface, str):
+        return _restricted_surface_response("invalid_session_surface")
+
+    match = _PLUGIN_SURFACE_RE.fullmatch(surface)
+    if match is None:
+        return _restricted_surface_response("invalid_session_surface")
+    plugin_id = match.group(1)
+
+    resolver = getattr(request.app.state, "dashboard_plugin_resolver", None)
+    if not callable(resolver):
+        return _restricted_surface_response("invalid_session_surface")
+    try:
+        manifest = resolver(plugin_id)
+    except Exception:
+        _log.exception(
+            "dashboard-auth: plugin registration lookup failed for %r",
+            plugin_id,
+        )
+        return _restricted_surface_response("invalid_session_surface")
+    if not isinstance(manifest, dict) or manifest.get("name") != plugin_id:
+        return _restricted_surface_response("invalid_session_surface")
+
+    tab = manifest.get("tab")
+    if not isinstance(tab, dict):
+        return _restricted_surface_response("invalid_session_surface")
+    plugin_path = tab.get("override") or tab.get("path")
+    if (
+        not isinstance(plugin_path, str)
+        or not plugin_path.startswith("/")
+        or plugin_path.startswith("//")
+        or plugin_path == "/api"
+        or plugin_path.startswith("/api/")
+        or plugin_path == "/auth"
+        or plugin_path.startswith("/auth/")
+        or plugin_path == "/login"
+        or plugin_path.startswith("/dashboard-plugins/")
+        or plugin_path.startswith("/assets/")
+        or "\\" in plugin_path
+        or any(
+            segment in {"", ".", ".."}
+            for segment in plugin_path[1:].split("/")
+        )
+    ):
+        return _restricted_surface_response("invalid_session_surface")
+
+    request.state.dashboard_plugin_id = plugin_id
+    request.state.dashboard_plugin_path = plugin_path
+
+    if _has_ambiguous_path_encoding(request):
+        return _restricted_surface_response("restricted_surface")
+
+    path = request.url.path
+    normalized = path.rstrip("/") or "/"
+    allowed_exact = {
+        "/",
+        plugin_path.rstrip("/") or "/",
+        "/api/auth/me",
+        "/api/dashboard/plugins",
+    }
+    if normalized in allowed_exact:
+        return None
+
+    for prefix in (
+        f"/api/plugins/{plugin_id}",
+        f"/dashboard-plugins/{plugin_id}",
+    ):
+        if path == prefix or path.startswith(prefix + "/"):
+            return None
+    return _restricted_surface_response("restricted_surface")
 
 
 def _client_ip(request: Request) -> str:
@@ -340,7 +495,11 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     path = request.url.path
-    if _path_is_public(path):
+    if _is_registered_provider_public_auth_path(request):
+        return await call_next(request)
+    # Plugin discovery is public in loopback mode, but gated sessions must be
+    # authenticated so scoped sessions can receive only their own manifest.
+    if _path_is_public(path) and path != "/api/dashboard/plugins":
         return await call_next(request)
 
     # RFC 8252 native-app bearer path (goal: no session cookies). The desktop
@@ -366,6 +525,9 @@ async def gated_auth_middleware(
             )
         if bearer_session is not None:
             request.state.session = bearer_session
+            denied = _surface_denial(request, bearer_session)
+            if denied is not None:
+                return denied
             return await call_next(request)
         # A bearer was presented but didn't verify (expired/invalid/unknown).
         # Return the structured 401 so the desktop knows to refresh or
@@ -470,7 +632,9 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
-            response = await call_next(request)
+            response = _surface_denial(request, new_session)
+            if response is None:
+                response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -517,6 +681,9 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
+    denied = _surface_denial(request, session)
+    if denied is not None:
+        return denied
     response = await call_next(request)
     if not provider_hint and session.provider:
         from hermes_cli.dashboard_auth.cookies import detect_https

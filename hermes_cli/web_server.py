@@ -18236,6 +18236,11 @@ def _discover_dashboard_plugins() -> list:
                     "css": data.get("css"),
                     "has_api": bool(safe_api),
                     "source": source,
+                    **(
+                        {"presentation": "workspace"}
+                        if data.get("presentation") == "workspace"
+                        else {}
+                    ),
                     "_dir": str(dashboard_dir),
                     "_api_file": safe_api,
                 })
@@ -18259,8 +18264,23 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
     return _dashboard_plugins_cache
 
 
+def _resolve_dashboard_plugin(plugin_id: str) -> Optional[dict]:
+    """Resolve a scoped-session plugin id against live dashboard discovery."""
+    return next(
+        (
+            plugin
+            for plugin in _get_dashboard_plugins()
+            if plugin.get("name") == plugin_id
+        ),
+        None,
+    )
+
+
+app.state.dashboard_plugin_resolver = _resolve_dashboard_plugin
+
+
 @app.get("/api/dashboard/plugins")
-async def get_dashboard_plugins():
+async def get_dashboard_plugins(request: Request):
     """Return discovered dashboard plugins (excludes user-hidden and non-enabled ones)."""
     def _run():
         plugins = _get_dashboard_plugins()
@@ -18296,10 +18316,12 @@ async def get_dashboard_plugins():
         return True
 
     # Strip internal fields before sending to frontend.
+    scoped_plugin_id = getattr(request.state, "dashboard_plugin_id", None)
     return [
         {k: v for k, v in p.items() if not k.startswith("_")}
         for p in plugins
         if _is_active(p)
+        and (scoped_plugin_id is None or p.get("name") == scoped_plugin_id)
     ]
 
 

@@ -102,6 +102,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+_CURRENT_PROFILE_ONLY: ContextVar = ContextVar(
+    "HERMES_CURRENT_PROFILE_ONLY", default=False
+)
 _BROWSER_CONTROL_PRINCIPAL: ContextVar = ContextVar(
     "HERMES_BROWSER_CONTROL_PRINCIPAL", default=_UNSET
 )
@@ -236,6 +239,7 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     profile: str = "",
+    current_profile_only: bool = False,
     browser_control_principal: str = "",
     browser_control_transport_family: str = "",
     cwd: str = "",
@@ -283,6 +287,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _CURRENT_PROFILE_ONLY.set(bool(current_profile_only)),
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
@@ -334,6 +339,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_PROFILE_ONLY.set(False)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -382,6 +388,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_PROFILE_ONLY.set(False)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -414,6 +421,11 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def current_profile_only() -> bool:
+    """Whether this task may access only its server-bound Hermes profile."""
+    return _CURRENT_PROFILE_ONLY.get() is True
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

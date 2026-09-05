@@ -10,9 +10,11 @@ from typing import Optional
 class Session:
     """A verified identity. Returned by ``complete_login`` and ``verify_session``.
 
-    All fields are mandatory. Providers that don't have a concept of orgs
-    should set ``org_id`` to an empty string. ``access_token`` and
-    ``refresh_token`` are opaque to Hermes — provider-specific.
+    Identity and token fields are mandatory. Providers that don't have a
+    concept of orgs should set ``org_id`` to an empty string. ``access_token``
+    and ``refresh_token`` are opaque to Hermes — provider-specific. Existing
+    providers inherit the full-authority ``dashboard`` surface; restricted
+    providers must return their cryptographically verified session surface.
     """
 
     user_id: str
@@ -23,6 +25,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    surface: str = "dashboard"
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,13 @@ class DashboardAuthProvider(ABC):
     # token-only credential (e.g. drain) is never offered a login. Mirrors
     # supports_token.
     supports_session: bool = True
+
+    # Exact unauthenticated plugin endpoints needed to establish a session
+    # (for example, a static invitation form and its one-use redemption POST).
+    # The auth middleware validates the complete tuple against ``name`` and
+    # ignores malformed declarations wholesale. Existing providers expose
+    # nothing publicly by default.
+    public_auth_paths: tuple[str, ...] = ()
 
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...

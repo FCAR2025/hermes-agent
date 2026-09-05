@@ -921,6 +921,7 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "surface": sess.surface,
     }
 
 
