@@ -600,6 +600,27 @@ def _get_env_config() -> Dict[str, Any]:
     _ensure_terminal_env_bridged()
     env_type = _tenv("TERMINAL_ENV", "local")
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    docker_auto_mount_profile_files = True
+    if env_type == "docker":
+        raw_value: Any = os.getenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES")
+        from_product_config = False
+        try:
+            from hermes_cli.config import read_raw_config
+            terminal_cfg = (read_raw_config() or {}).get("terminal")
+            if isinstance(terminal_cfg, dict) and "docker_auto_mount_profile_files" in terminal_cfg:
+                raw_value = terminal_cfg["docker_auto_mount_profile_files"]
+                from_product_config = True
+        except (ImportError, OSError):
+            pass
+        if raw_value is not None:
+            if from_product_config and not isinstance(raw_value, bool):
+                raise TypeError("terminal.docker_auto_mount_profile_files must be a boolean")
+            if isinstance(raw_value, bool):
+                docker_auto_mount_profile_files = raw_value
+            elif isinstance(raw_value, str) and raw_value.strip().lower() in {"true", "1", "yes", "false", "0", "no"}:
+                docker_auto_mount_profile_files = raw_value.strip().lower() in {"true", "1", "yes"}
+            else:
+                raise ValueError("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES must be a boolean")
 
     # Container/docker-only payloads are parsed only when such a backend is
     # selected: a stale or invalid Docker value bridged from config.yaml must
@@ -655,6 +676,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
+        "docker_auto_mount_profile_files": docker_auto_mount_profile_files,
         "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
         "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
         "docker_extra_args": docker_extra_args,
