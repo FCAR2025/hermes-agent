@@ -43,6 +43,7 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_PROFILE_MOUNTS_LABEL_KEY = "hermes-profile-mounts"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -887,7 +888,10 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        auto_mount_profile_files: bool = True,
     ):
+        if not isinstance(auto_mount_profile_files, bool):
+            raise TypeError("auto_mount_profile_files must be a boolean")
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -1008,85 +1012,87 @@ class DockerEnvironment(BaseEnvironment):
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 
-        # Mount credential files (OAuth tokens, etc.) declared by skills.
-        # Read-only so the container can authenticate but not modify host creds.
-        try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                get_skills_directory_mount,
-                get_cache_directory_mounts,
-            )
-
-            for mount_entry in get_credential_file_mounts():
-                src = Path(mount_entry["host_path"])
-                if src.is_dir():
-                    # Docker-in-Docker: Docker auto-created the source path as
-                    # a directory when it didn't exist on the host.  Mounting a
-                    # directory over a file destination causes exit 125.
-                    logger.warning(
-                        "Docker: skipping credential mount — source is a directory "
-                        "(likely Docker-in-Docker auto-creation): %s",
-                        src,
-                    )
-                    continue
-                if not src.is_file():
-                    logger.warning(
-                        "Docker: skipping credential mount — source not found: %s", src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting credential %s -> %s",
-                    mount_entry["host_path"],
-                    mount_entry["container_path"],
+        # Mount credential files, skills, and host caches as one profile-data
+        # bundle. Isolated runtimes can disable the entire automatic bundle;
+        # explicitly configured ``volumes`` above remain untouched.
+        if auto_mount_profile_files:
+            try:
+                from tools.credential_files import (
+                    get_credential_file_mounts,
+                    get_skills_directory_mount,
+                    get_cache_directory_mounts,
                 )
 
-            # Mount skill directories (local + external) so skill
-            # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
-                src = Path(skills_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping skills mount — source is not a directory: %s",
-                        src,
+                for mount_entry in get_credential_file_mounts():
+                    src = Path(mount_entry["host_path"])
+                    if src.is_dir():
+                        # Docker-in-Docker: Docker auto-created the source path as
+                        # a directory when it didn't exist on the host.  Mounting a
+                        # directory over a file destination causes exit 125.
+                        logger.warning(
+                            "Docker: skipping credential mount — source is a directory "
+                            "(likely Docker-in-Docker auto-creation): %s",
+                            src,
+                        )
+                        continue
+                    if not src.is_file():
+                        logger.warning(
+                            "Docker: skipping credential mount — source not found: %s", src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting credential %s -> %s",
+                        mount_entry["host_path"],
+                        mount_entry["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting skills dir %s -> %s",
-                    skills_mount["host_path"],
-                    skills_mount["container_path"],
-                )
 
-            # Mount host-side cache directories (documents, images, audio,
-            # screenshots) so the agent can access uploaded files and other
-            # cached media from inside the container.  Read-only — the
-            # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
-                src = Path(cache_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping cache mount — source is not a directory: %s",
-                        src,
+                # Mount skill directories (local + external) so skill
+                # scripts/templates are available inside the container.
+                for skills_mount in get_skills_directory_mount():
+                    src = Path(skills_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping skills mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting skills dir %s -> %s",
+                        skills_mount["host_path"],
+                        skills_mount["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting cache dir %s -> %s",
-                    cache_mount["host_path"],
-                    cache_mount["container_path"],
-                )
-        except Exception as e:
-            logger.debug("Docker: could not load credential file mounts: %s", e)
+
+                # Mount host-side cache directories (documents, images, audio,
+                # screenshots) so the agent can access uploaded files and other
+                # cached media from inside the container.  Read-only — the
+                # container reads these but the host gateway manages writes.
+                for cache_mount in get_cache_directory_mounts():
+                    src = Path(cache_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping cache mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting cache dir %s -> %s",
+                        cache_mount["host_path"],
+                        cache_mount["container_path"],
+                    )
+            except Exception as e:
+                logger.debug("Docker: could not load credential file mounts: %s", e)
 
         # Egress credential-injection proxy (iron-proxy) — when configured,
         # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
@@ -1370,11 +1376,13 @@ class DockerEnvironment(BaseEnvironment):
         # container-start time and never changes for the container's lifetime.
         profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
+        profile_mounts_label = "on" if auto_mount_profile_files else "off"
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_PROFILE_MOUNTS_LABEL_KEY}={profile_mounts_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1387,6 +1395,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _PROFILE_MOUNTS_LABEL_KEY: profile_mounts_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1403,7 +1412,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, profile_mounts_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1664,6 +1673,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_PROFILE_MOUNTS_LABEL_KEY, "on"),
         )
         if existing is not None:
             cid, state = existing
@@ -1828,6 +1838,7 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        profile_mounts_label: str,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -1846,6 +1857,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_PROFILE_MOUNTS_LABEL_KEY}={profile_mounts_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])

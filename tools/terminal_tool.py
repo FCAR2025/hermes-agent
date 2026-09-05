@@ -1603,6 +1603,45 @@ def _get_env_config() -> Dict[str, Any]:
     container_backend = env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
     docker_backend = env_type == "docker"
 
+    docker_auto_mount_profile_files = True
+    if docker_backend:
+        raw_value: Any = os.getenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES")
+        value_from_product_config = False
+        try:
+            from hermes_cli.config import read_raw_config
+
+            raw_terminal = (read_raw_config() or {}).get("terminal")
+            if (
+                isinstance(raw_terminal, dict)
+                and "docker_auto_mount_profile_files" in raw_terminal
+            ):
+                raw_value = raw_terminal["docker_auto_mount_profile_files"]
+                value_from_product_config = True
+        except (ImportError, OSError):
+            pass
+
+        if raw_value is not None:
+            if value_from_product_config and not isinstance(raw_value, bool):
+                raise TypeError(
+                    "terminal.docker_auto_mount_profile_files must be a boolean"
+                )
+            if isinstance(raw_value, bool):
+                docker_auto_mount_profile_files = raw_value
+            elif isinstance(raw_value, str):
+                normalized = raw_value.strip().lower()
+                if normalized in {"true", "1", "yes"}:
+                    docker_auto_mount_profile_files = True
+                elif normalized in {"false", "0", "no"}:
+                    docker_auto_mount_profile_files = False
+                else:
+                    raise ValueError(
+                        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES must be a boolean"
+                    )
+            else:
+                raise TypeError(
+                    "terminal.docker_auto_mount_profile_files must be a boolean"
+                )
+
     # Docker/container-only env vars may be bridged from config.yaml even when
     # the active backend is local/ssh.  Do not parse their JSON/numeric payloads
     # until a backend that can consume them is selected; a stale or invalid
@@ -1703,6 +1742,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_auto_mount_profile_files": docker_auto_mount_profile_files,
         "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
@@ -1768,6 +1808,9 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_forward_env": config.get("docker_forward_env", []),
         "docker_env": config.get("docker_env", {}),
         "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_auto_mount_profile_files": config.get(
+            "docker_auto_mount_profile_files", True
+        ),
         "docker_extra_args": config.get("docker_extra_args", []),
         "docker_shm_size": config.get("docker_shm_size", "1g"),
         "docker_network": config.get("docker_network", True),
@@ -1841,6 +1884,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            auto_mount_profile_files=cc.get(
+                "docker_auto_mount_profile_files", True
+            ),
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=(
