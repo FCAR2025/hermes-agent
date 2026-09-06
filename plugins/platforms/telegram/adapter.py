@@ -5647,6 +5647,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _maybe_handle_fcar_gateway_command(self, event: MessageEvent) -> bool:
         """Consume namespaced FCAR Action Gateway commands and fail closed."""
+        command = str(getattr(event, "text", None) or "").strip().split(None, 1)[0].lower()
+        if not command.startswith("/fcar_gateway_"):
+            return False
         try:
             from gateway.fcar_action_gateway_commands import handle_fcar_gateway_command
             source = getattr(event, "source", None)
@@ -5669,7 +5672,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._send_message_with_thread_fallback(**kwargs)
             return True
         except Exception as exc:
-            logger.warning("[%s] FCAR gateway command handler failed closed: %s", self.name, exc)
+            logger.warning("[%s] FCAR gateway command handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
             return True
 
     async def _maybe_handle_instar_loop_decision(self, event: MessageEvent) -> bool:

@@ -172,12 +172,15 @@ class GatewayAgentCacheMixin:
                     try:
                         lane = configured_anthropic_proxy_lane()
                     except ConfigLaneUnavailable as exc:
-                        lane = None
                         logger.warning(
-                            "config.yaml unreadable (%s); leaving persisted /model override for session=%s unchanged",
+                            "config.yaml unreadable (%s); refusing to rehydrate persisted /model override for session=%s",
                             exc, session_key,
                         )
-                    if lane is not None and not is_on_configured_lane(provider, lane):
+                        return
+                    if lane is not None and not is_on_configured_lane(
+                        provider, lane, base_url=str(override.get("base_url") or ""),
+                        api_mode="",
+                    ):
                         provider = lane.provider
                         override.update(
                             model=strip_anthropic_prefix(override["model"]),

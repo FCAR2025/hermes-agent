@@ -611,6 +611,30 @@ def _terminal_bool_config_value(terminal_config, config_key: str, env_name: str,
     raise ValueError(f"{env_name} must be a boolean")
 
 
+def _strict_terminal_config() -> dict:
+    """Read an existing config document without tolerant fallback."""
+    from hermes_cli.config import fast_safe_load, get_config_path
+
+    path = get_config_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = fast_safe_load(handle)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise RuntimeError(f"config.yaml unreadable: {exc}") from exc
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        raise RuntimeError(f"config.yaml unreadable: expected mapping, got {type(document).__name__}")
+    terminal = document.get("terminal", {})
+    if terminal is None:
+        return {}
+    if not isinstance(terminal, dict):
+        raise RuntimeError("config.yaml unreadable: terminal must be a mapping")
+    return terminal
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Resolve the terminal configuration dict from TERMINAL_* env vars."""
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
@@ -619,11 +643,7 @@ def _get_env_config() -> Dict[str, Any]:
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
     raw_terminal_config = {}
     if env_type == "docker":
-        try:
-            from hermes_cli.config import read_raw_config
-            raw_terminal_config = (read_raw_config() or {}).get("terminal", {})
-        except (ImportError, OSError):
-            pass
+        raw_terminal_config = _strict_terminal_config()
     docker_auto_mount_profile_files = _terminal_bool_config_value(
         raw_terminal_config, "docker_auto_mount_profile_files",
         "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", default=True,

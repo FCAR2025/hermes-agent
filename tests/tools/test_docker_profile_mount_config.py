@@ -1,6 +1,7 @@
 """Behavioral tests for Docker's automatic Hermes profile mount gate."""
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -139,29 +140,38 @@ def test_terminal_env_config_rejects_malformed_profile_mount_value(monkeypatch):
         terminal_tool._get_env_config()
 
 
-def test_terminal_product_config_false_overrides_environment(monkeypatch):
+def test_terminal_product_config_false_overrides_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", "true")
-    monkeypatch.setattr(
-        "hermes_cli.config.read_raw_config",
-        lambda: {"terminal": {"docker_auto_mount_profile_files": False}},
-    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("terminal:\n  docker_auto_mount_profile_files: false\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
 
     assert terminal_tool._get_env_config()["docker_auto_mount_profile_files"] is False
 
 
-def test_terminal_product_config_rejects_non_boolean_value(monkeypatch):
+def test_terminal_product_config_rejects_non_boolean_value(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
     monkeypatch.setenv("TERMINAL_ENV", "docker")
-    monkeypatch.setattr(
-        "hermes_cli.config.read_raw_config",
-        lambda: {"terminal": {"docker_auto_mount_profile_files": "false"}},
-    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("terminal:\n  docker_auto_mount_profile_files: 'false'\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
 
     with pytest.raises(
         TypeError, match="terminal.docker_auto_mount_profile_files must be a boolean"
     ):
+        terminal_tool._get_env_config()
+
+
+def test_existing_unreadable_config_refuses_docker_defaults(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.mkdir()
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: Path(config_path))
+
+    with pytest.raises(RuntimeError, match="config.yaml unreadable"):
         terminal_tool._get_env_config()
 
 

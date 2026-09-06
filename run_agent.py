@@ -759,9 +759,12 @@ class AIAgent(
             )
             return
         try:
-            self._restore_primary_runtime()
+            restored = self._restore_primary_runtime()
         except Exception:
-            pass
+            restored = False
+        if not restored and getattr(self, "_fallback_activated", False):
+            logger.warning("bg-review skipped: primary runtime restore failed while fallback remains active")
+            return
 
         # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
         # alias the live history's nested tool_calls/content.

@@ -1087,8 +1087,17 @@ def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
     return ProxyLane(provider, base_url, "anthropic_messages", api_key)
 
 
-def is_on_configured_lane(provider: str, lane: ProxyLane) -> bool:
-    return str(provider or "").strip().lower() == lane.provider.strip().lower()
+def is_on_configured_lane(
+    provider: str,
+    lane: ProxyLane,
+    *,
+    base_url: str = "",
+    api_mode: str = "",
+) -> bool:
+    provider_matches = str(provider or "").strip().lower() == lane.provider.strip().lower()
+    origin_matches = bool(base_url) and base_url_origin(base_url) == base_url_origin(lane.base_url)
+    mode_matches = str(api_mode or "").strip().lower() == lane.api_mode
+    return provider_matches and origin_matches and mode_matches
 
 
 @dataclass
@@ -1548,7 +1557,10 @@ def switch_model(
             return st.fail(_CONFIG_UNREADABLE_MSG)
         if lane is not None:
             st.endpoint_pin = lane
-            if not is_on_configured_lane(st.target_provider, lane):
+            if not is_on_configured_lane(
+                st.target_provider, lane, base_url=st.current_base_url,
+                api_mode=determine_api_mode(st.target_provider, st.current_base_url),
+            ):
                 st.target_provider = lane.provider
                 st.new_model = strip_anthropic_prefix(st.new_model)
     for step in (_resolve_switch_credentials, _validate_switch):

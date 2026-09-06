@@ -89,6 +89,19 @@ async def test_maybe_handle_fcar_gateway_command_ignores_hermes_native_approve(t
 
 
 @pytest.mark.asyncio
+async def test_optional_fcar_import_failure_does_not_consume_native_approve(tmp_path, monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter.config = PlatformConfig(enabled=True, token="test", extra={"fcar_action_gateway_dir": str(tmp_path)})
+    adapter._send_message_with_thread_fallback = AsyncMock()
+    monkeypatch.setitem(sys.modules, "gateway.fcar_action_gateway_commands", None)
+
+    consumed = await adapter._maybe_handle_fcar_gateway_command(_event("/approve"))
+
+    assert consumed is False
+    adapter._send_message_with_thread_fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handle_command_consumes_fcar_gateway_before_llm_dispatch():
     adapter = object.__new__(TelegramAdapter)
     msg = SimpleNamespace(text="/fcar_gateway_status")

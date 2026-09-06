@@ -194,6 +194,24 @@ class TestBackgroundReviewRuntime:
             agent._spawn_background_review([], review_skills=True)
             MockThread.assert_not_called()
 
+    def test_failed_restore_preserves_proxy_marks_and_skips_background_review(self):
+        agent = _make_agent(
+            fallback_model={"provider": "custom", "model": "fallback", "base_url": DEAD_PROXY},
+        )
+        self._activate_fallback(agent)
+        agent._mark_proxy_empty_exhausted(DEAD_PROXY)
+        agent._rate_limited_until = float("inf")
+
+        assert agent._restore_primary_runtime() is False
+        assert DEAD_PROXY.rstrip("/").lower() in agent._empty_exhausted_base_urls
+
+        with (
+            patch.object(agent, "_restore_primary_runtime", return_value=False),
+            patch("run_agent.threading.Thread") as mock_thread,
+        ):
+            agent._spawn_background_review([], review_skills=True)
+        mock_thread.assert_not_called()
+
 
 # =============================================================================
 # FIX 4 — fallback must skip entries on a proxy that already empty-exhausted

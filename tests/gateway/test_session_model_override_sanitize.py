@@ -135,7 +135,7 @@ def _rehydrate(store, session_key, *, config=_PROXY_LANE_CONFIG, lane_side_effec
              },
          ):
         runner._rehydrate_session_model_override(session_key)
-    return runner._session_model_overrides[session_key]
+    return runner._session_model_overrides.get(session_key)
 
 
 def _seed(store_factory, override):
@@ -211,7 +211,7 @@ def test_non_claude_model_on_anthropic_is_untouched(store_factory):
     assert override["base_url"] == "https://api.anthropic.com"
 
 
-def test_unreadable_config_leaves_the_override_alone(store_factory, caplog):
+def test_unreadable_config_does_not_rehydrate_off_lane_override(store_factory, caplog):
     """Fail closed on the READ: we cannot prove where the configured lane
     points, so we neither rewrite the override nor bless the vendor-direct pin.
     The operator gets a WARNING instead of silence."""
@@ -226,12 +226,22 @@ def test_unreadable_config_leaves_the_override_alone(store_factory, caplog):
             lane_side_effect=ConfigLaneUnavailable("permission denied"),
         )
 
-    assert override["provider"] == "anthropic"
-    assert override["base_url"] == "https://api.anthropic.com"
+    assert override is None
     assert store_factory().get_model_override(session_key) == POISONED_OVERRIDE
     assert any(
         "config.yaml unreadable" in r.getMessage() for r in caplog.records
     )
+
+
+def test_same_provider_without_lane_origin_is_sanitized(store_factory):
+    session_key = _seed(store_factory, {
+        "model": "claude-opus-5", "provider": "custom", "base_url": "",
+    })
+
+    override = _rehydrate(store_factory(), session_key)
+
+    assert override["provider"] == "custom"
+    assert override["base_url"] == PROXY_BASE_URL
 
 
 def test_vendor_slug_override_is_pinned_and_prefix_stripped(store_factory):
