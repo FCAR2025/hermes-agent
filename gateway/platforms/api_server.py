@@ -2301,6 +2301,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            # Read-only authenticated Kanban task snapshot (host-local shared
+            # board, canonical kanban_home; never creates or mutates a DB).
+            ("GET", "/v1/kanban/boards/{board_slug}/tasks/{task_id}", self._handle_kanban_task_snapshot),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -3457,8 +3460,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     "method": "GET",
                     "path": "/v1/artifacts/download/{artifact_id}",
                 },
+                "kanban_task_snapshot": {
+                    "method": "GET",
+                    "path": "/v1/kanban/boards/{board_slug}/tasks/{task_id}",
+                },
             },
         })
+
+    async def _handle_kanban_task_snapshot(self, request: "web.Request") -> "web.Response":
+        """GET /v1/kanban/boards/{board_slug}/tasks/{task_id} — read-only snapshot.
+
+        Returns a closed {hostId, boardSlug, taskId, revision, status,
+        observedAt} document for the host-local shared Kanban board. Never
+        reads titles/bodies/comments/outputs and never writes to the DB.
+        """
+        from gateway.kanban_snapshot import (
+            InvalidKanbanIdentifier,
+            KanbanSnapshotError,
+            read_kanban_task_snapshot,
+        )
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            snapshot = read_kanban_task_snapshot(
+                request.match_info.get("board_slug", ""),
+                request.match_info.get("task_id", ""),
+            )
+        except InvalidKanbanIdentifier:
+            return web.json_response(
+                {"error": {"message": "Invalid Kanban identifier"}}, status=400
+            )
+        except KanbanSnapshotError as exc:
+            return web.json_response(
+                {"error": {"message": "Kanban board or task not found"}},
+                status=getattr(exc, "http_status", 404),
+            )
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Kanban snapshot unavailable"}}, status=500
+            )
+        return web.json_response(snapshot)
 
     # ------------------------------------------------------------------
     # Browser-extension control (authenticated local/VPS API)
