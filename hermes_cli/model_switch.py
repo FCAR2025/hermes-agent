@@ -1546,10 +1546,11 @@ def switch_model(
             lane = configured_anthropic_proxy_lane()
         except ConfigLaneUnavailable:
             return st.fail(_CONFIG_UNREADABLE_MSG)
-        if lane is not None and not is_on_configured_lane(st.target_provider, lane):
+        if lane is not None:
             st.endpoint_pin = lane
-            st.target_provider = lane.provider
-            st.new_model = strip_anthropic_prefix(st.new_model)
+            if not is_on_configured_lane(st.target_provider, lane):
+                st.target_provider = lane.provider
+                st.new_model = strip_anthropic_prefix(st.new_model)
     for step in (_resolve_switch_credentials, _validate_switch):
         fail = step(st)
         if fail is not None:

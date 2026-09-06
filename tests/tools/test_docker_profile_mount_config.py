@@ -5,6 +5,7 @@ import subprocess
 import pytest
 
 import tools.terminal_tool as terminal_tool
+import tools.terminal_tool_backends as terminal_backends
 from tools.environments import docker as docker_env
 
 
@@ -107,10 +108,10 @@ def test_terminal_config_forwards_profile_mount_flag(monkeypatch):
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", fake_docker)
+    monkeypatch.setattr(terminal_backends, "_DockerEnvironment", fake_docker)
     monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda _cc: None)
 
-    terminal_tool._create_environment(
+    terminal_backends._create_environment(
         env_type="docker",
         image="python:3.11",
         cwd="/root",

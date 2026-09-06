@@ -152,7 +152,7 @@ def _run_switch(
              "hermes_cli.model_switch.normalize_model_for_provider",
              side_effect=lambda model, provider: model,
          ), \
-         patch("hermes_cli.models.validate_requested_model", return_value=_ACCEPTED), \
+         patch("hermes_cli.models_validate.validate_requested_model", return_value=_ACCEPTED), \
          patch("hermes_cli.models.detect_provider_for_model", return_value=detected), \
          patch("hermes_cli.model_switch.get_model_info", return_value=None), \
          patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
@@ -555,7 +555,7 @@ def test_unreadable_config_file_refuses_to_route_a_claude_name():
     with _unreadable_config_file():
         with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
              patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
-             patch("hermes_cli.models.validate_requested_model", return_value=_ACCEPTED), \
+             patch("hermes_cli.models_validate.validate_requested_model", return_value=_ACCEPTED), \
              patch("hermes_cli.models.detect_provider_for_model", return_value=None):
             result = switch_model(
                 raw_input="claude-opus-5",
