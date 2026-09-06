@@ -1592,6 +1592,31 @@ def _ensure_terminal_env_bridged() -> None:
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
+def _terminal_bool_config_value(
+    terminal_config: object,
+    config_key: str,
+    env_name: str,
+    *,
+    default: bool,
+) -> bool:
+    """Resolve a profile-scoped terminal boolean before process env fallback."""
+    if isinstance(terminal_config, dict) and config_key in terminal_config:
+        value = terminal_config[config_key]
+        if not isinstance(value, bool):
+            raise TypeError(f"terminal.{config_key} must be a boolean")
+        return value
+
+    raw_value = os.getenv(env_name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"{env_name} must be a boolean")
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1603,44 +1628,26 @@ def _get_env_config() -> Dict[str, Any]:
     container_backend = env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
     docker_backend = env_type == "docker"
 
-    docker_auto_mount_profile_files = True
+    raw_terminal_config: object = {}
     if docker_backend:
-        raw_value: Any = os.getenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES")
-        value_from_product_config = False
         try:
             from hermes_cli.config import read_raw_config
 
-            raw_terminal = (read_raw_config() or {}).get("terminal")
-            if (
-                isinstance(raw_terminal, dict)
-                and "docker_auto_mount_profile_files" in raw_terminal
-            ):
-                raw_value = raw_terminal["docker_auto_mount_profile_files"]
-                value_from_product_config = True
+            raw_terminal_config = (read_raw_config() or {}).get("terminal", {})
         except (ImportError, OSError):
             pass
-
-        if raw_value is not None:
-            if value_from_product_config and not isinstance(raw_value, bool):
-                raise TypeError(
-                    "terminal.docker_auto_mount_profile_files must be a boolean"
-                )
-            if isinstance(raw_value, bool):
-                docker_auto_mount_profile_files = raw_value
-            elif isinstance(raw_value, str):
-                normalized = raw_value.strip().lower()
-                if normalized in {"true", "1", "yes"}:
-                    docker_auto_mount_profile_files = True
-                elif normalized in {"false", "0", "no"}:
-                    docker_auto_mount_profile_files = False
-                else:
-                    raise ValueError(
-                        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES must be a boolean"
-                    )
-            else:
-                raise TypeError(
-                    "terminal.docker_auto_mount_profile_files must be a boolean"
-                )
+    docker_auto_mount_profile_files = _terminal_bool_config_value(
+        raw_terminal_config,
+        "docker_auto_mount_profile_files",
+        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES",
+        default=True,
+    ) if docker_backend else True
+    docker_network = _terminal_bool_config_value(
+        raw_terminal_config if docker_backend else {},
+        "docker_network",
+        "TERMINAL_DOCKER_NETWORK",
+        default=True,
+    )
 
     # Docker/container-only env vars may be bridged from config.yaml even when
     # the active backend is local/ssh.  Do not parse their JSON/numeric payloads
@@ -1743,7 +1750,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_auto_mount_profile_files": docker_auto_mount_profile_files,
-        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
+        "docker_network": docker_network,
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
         # Cross-process container reuse (issue #20561).  The docs claim

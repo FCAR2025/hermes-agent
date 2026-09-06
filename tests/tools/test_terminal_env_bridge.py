@@ -23,6 +23,8 @@ def _reset_bridge_state(monkeypatch):
         "TERMINAL_CWD",
         "TERMINAL_DOCKER_IMAGE",
         "TERMINAL_SSH_HOST",
+        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES",
+        "TERMINAL_DOCKER_NETWORK",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -83,6 +85,24 @@ def test_explicit_config_key_overrides_matching_env_value(monkeypatch):
 
     assert config["env_type"] == "docker"
     assert config["docker_image"] == "config/image:1"
+
+
+def test_explicit_isolation_flags_bridge_and_remain_false(monkeypatch):
+    _write_config(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_auto_mount_profile_files: false\n"
+        "  docker_network: false\n"
+    )
+    monkeypatch.setenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "true")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_auto_mount_profile_files"] is False
+    assert config["docker_network"] is False
+    assert os.environ["TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES"] == "False"
+    assert os.environ["TERMINAL_DOCKER_NETWORK"] == "False"
 
 
 def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):

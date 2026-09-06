@@ -3516,6 +3516,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
     "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+    "docker_auto_mount_profile_files": "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
