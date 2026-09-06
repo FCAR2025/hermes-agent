@@ -594,33 +594,44 @@ def _resolve_config_cwd(env_type: str, mount_docker_cwd: bool) -> tuple:
     return cwd, host_cwd
 
 
+def _terminal_bool_config_value(terminal_config, config_key: str, env_name: str, *, default: bool) -> bool:
+    if isinstance(terminal_config, dict) and config_key in terminal_config:
+        value = terminal_config[config_key]
+        if not isinstance(value, bool):
+            raise TypeError(f"terminal.{config_key} must be a boolean")
+        return value
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"{env_name} must be a boolean")
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Resolve the terminal configuration dict from TERMINAL_* env vars."""
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
     env_type = _tenv("TERMINAL_ENV", "local")
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
-    docker_auto_mount_profile_files = True
+    raw_terminal_config = {}
     if env_type == "docker":
-        raw_value: Any = os.getenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES")
-        from_product_config = False
         try:
             from hermes_cli.config import read_raw_config
-            terminal_cfg = (read_raw_config() or {}).get("terminal")
-            if isinstance(terminal_cfg, dict) and "docker_auto_mount_profile_files" in terminal_cfg:
-                raw_value = terminal_cfg["docker_auto_mount_profile_files"]
-                from_product_config = True
+            raw_terminal_config = (read_raw_config() or {}).get("terminal", {})
         except (ImportError, OSError):
             pass
-        if raw_value is not None:
-            if from_product_config and not isinstance(raw_value, bool):
-                raise TypeError("terminal.docker_auto_mount_profile_files must be a boolean")
-            if isinstance(raw_value, bool):
-                docker_auto_mount_profile_files = raw_value
-            elif isinstance(raw_value, str) and raw_value.strip().lower() in {"true", "1", "yes", "false", "0", "no"}:
-                docker_auto_mount_profile_files = raw_value.strip().lower() in {"true", "1", "yes"}
-            else:
-                raise ValueError("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES must be a boolean")
+    docker_auto_mount_profile_files = _terminal_bool_config_value(
+        raw_terminal_config, "docker_auto_mount_profile_files",
+        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", default=True,
+    ) if env_type == "docker" else True
+    docker_network = _terminal_bool_config_value(
+        raw_terminal_config if env_type == "docker" else {}, "docker_network",
+        "TERMINAL_DOCKER_NETWORK", default=True,
+    )
 
     # Container/docker-only payloads are parsed only when such a backend is
     # selected: a stale or invalid Docker value bridged from config.yaml must
@@ -678,7 +689,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
         "docker_auto_mount_profile_files": docker_auto_mount_profile_files,
         "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
-        "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
+        "docker_network": docker_network,
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
         # Cross-process reuse: attach to a labeled container at startup
