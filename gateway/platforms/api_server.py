@@ -98,7 +98,8 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+    ("kanban_task_snapshot", ("GET", "/v1/kanban/boards/{board_slug}/tasks/{task_id}")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -1525,6 +1526,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            ("GET", "/v1/kanban/boards/{board_slug}/tasks/{task_id}", self._handle_kanban_task_snapshot),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2286,6 +2288,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         "cloud": "authenticated-gateway-rpc"}}},
             "endpoints": {name: {"method": m, "path": p} for name, (m, p) in _CAPABILITY_ENDPOINTS},
         })
+
+    @_require_auth
+    async def _handle_kanban_task_snapshot(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_snapshot import (
+            InvalidKanbanIdentifier, KanbanSnapshotError, read_kanban_task_snapshot)
+        try:
+            snapshot = read_kanban_task_snapshot(
+                request.match_info.get("board_slug", ""),
+                request.match_info.get("task_id", ""),
+            )
+        except InvalidKanbanIdentifier:
+            return web.json_response({"error": {"message": "Invalid Kanban identifier"}}, status=400)
+        except KanbanSnapshotError as exc:
+            return web.json_response(
+                {"error": {"message": "Kanban board or task not found"}},
+                status=getattr(exc, "http_status", 404),
+            )
+        except Exception:
+            return web.json_response({"error": {"message": "Kanban snapshot unavailable"}}, status=500)
+        return web.json_response(snapshot)
 
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
 
