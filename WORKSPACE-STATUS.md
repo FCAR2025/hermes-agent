@@ -1,23 +1,31 @@
-# Workspace status — INERT (read before running anything here)
+# Workspace status — CURRENT SOURCE, INERT COMPLIANCE ARCHIVE
 
-**This is not the live Hermes agent.** The live agent is `/home/info/.hermes/hermes-agent`
-(v0.19.0, branch `joy-main-20260725`), run by `hermes-gateway.service`.
+This checkout is not a live Hermes runtime. On 2026-09-06 it was fast-forwarded
+to the verified history-join commit `ae5dc9ff7f0dd0a608cdb1722a9a4df5a401733c`,
+which descends from current upstream `693641aa8b4359c602283bdbbc14041e03bc47bc`
+and the preserved compliance branch at `194eba9ce2b1f94b40fb2b21e43605ac85fcadeb`.
 
-Verified 2026-07-25: nothing on this box references this workspace — no systemd unit,
-no script in `~/scripts`, no `~/.local/bin` wrapper, no crontab entry. The
-`/home/info/hermes` symlink points at the parent directory but nothing follows it.
+The live information gateway still launches from `/home/info/.hermes/hermes-agent`.
+Separately supervised FCAR gateway and dashboard processes use the pinned
+`/opt/fcar-command-runtime/c66a78ba` release. No service, wrapper, scheduler, or
+running process references this checkout.
 
-## Why HEAD is pinned at v0.10.0
+## Preserved compliance material
 
-`HEAD` sits on `3c20ded04` (v0.10.0, April 2026) **on purpose**. The unique content here
-is `hooks/compliance_gates/` (base, letter, sms, status + tests) and `roles/`, authored
-2026-04-20/21 against that tree's hook API. Updating this checkout to current upstream
-would leave that code orphaned against an incompatible base, so it was left pinned.
+`hooks/compliance_gates/` and `roles/ces_ceo.md` remain archival local material.
+Their 17 focused unit tests pass on the current upstream tree, but they are not
+registered in the current Hermes hook/runtime path and have no live consumer.
+Do not treat their presence or green helper tests as deployment, current legal
+policy approval, or authorization to send messages or change lead status.
 
-Those files were untracked until 2026-07-25 — the only copy on the box, one `git clean`
-from loss. They are now committed on branch `preserve/compliance-gates-20260725`.
+The remaining medium gaps are explicit:
 
-## If you want this workspace current
+- no current-hook registration or end-to-end dispatcher test;
+- no authoritative policy-owner review against current legal/compliance rules;
+- no live runtime discovery, negative authorization, or delivery readback.
 
-Port `hooks/compliance_gates/` to the current hook API first, then update — do not
-fast-forward and hope. Rollback notes: `/opt/agentic/shared/core/runbooks/hermes-rollback.md`.
+Keep this material inert until a separately scoped integration supplies those
+owners and proofs. Do not expand its legal rules opportunistically.
+
+The untracked `.omc/` state belongs to existing workspace tooling and was
+preserved byte-for-byte across the source fast-forward.
