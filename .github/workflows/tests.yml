@@ -15,8 +15,9 @@ jobs:
   test:
     name: Run tests
     # Upstream uses one 96-core runner for the whole suite. Forks use the
-    # available standard hosted runner. There is no slicing: it cost a matrix
-    # job, a duration cache, a per-slice artifact and a merge job to do it.
+    # available standard hosted runner and run the same complete suite on its
+    # available cores. Upstream does not slice: it would cost a matrix job, a
+    # duration cache, a per-slice artifact and a merge job to do it.
     #
     # On upstream, 96 cores clear the floor that the slowest single test file
     # sets (about 82s). A second slice divides work that is already at that

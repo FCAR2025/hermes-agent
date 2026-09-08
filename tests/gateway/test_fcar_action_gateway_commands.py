@@ -34,6 +34,7 @@ def gateway_double(monkeypatch):
                     "action_class": "external_send",
                     "channel": "telegram",
                     "payload_hash": "sha256:test-payload",
+                    "payload": {"message": "secret payload should not appear", "target": "dry-run-only"},
                 }
             )
         return {
@@ -102,7 +103,7 @@ def test_fcar_gateway_hyphen_alias_is_supported_but_not_required(tmp_path):
     assert parsed.used_hyphen_alias is True
 
 
-def test_fcar_gateway_reject_appends_gateway_review_entry_only(tmp_path, gateway_double):
+def test_fcar_gateway_reject_calls_private_review_contract(tmp_path, gateway_double):
     from gateway.fcar_action_gateway_commands import handle_fcar_gateway_command
 
     key = KEY
@@ -135,8 +136,30 @@ def test_fcar_gateway_approve_runs_dry_run_mock_readback_chain(tmp_path, gateway
     assert result.external_side_effect is False
     assert "Dry-run approved" in result.text
     assert "mock readback verified" in result.text.lower()
-    gateway_double.contract.approve_dry_run.assert_called_once()
-    gateway_double.contract.execute_mock_readback.assert_called_once()
+    gateway_double.contract.compute_payload_hash.assert_called_once_with({"key": key})
+    gateway_double.contract.approve_dry_run.assert_called_once_with(
+        gateway_dir=tmp_path,
+        idempotency_key=key,
+        approval_id="fcar-gateway-dry-run:telegram-test:sthash000001",
+        allowed_executor="fcar-gateway.mock-executor",
+        readback_probe={
+            "type": "mock_fcar_gateway_readback",
+            "idempotency_key": key,
+            "reviewer": "telegram-test",
+            "dry_run_only": True,
+        },
+    )
+    gateway_double.contract.execute_mock_readback.assert_called_once_with(
+        gateway_dir=tmp_path,
+        idempotency_key=key,
+        mock_readback={
+            "type": "mock_fcar_gateway_readback",
+            "idempotency_key": key,
+            "verified_by": "telegram-test",
+            "dry_run_only": True,
+            "external_side_effect": False,
+        },
+    )
 
 
 def test_fcar_gateway_status_reports_audit_pass(tmp_path, gateway_double):
