@@ -9668,7 +9668,12 @@ class TelegramAdapter(BasePlatformAdapter):
             scripts_dir = _Path("/home/info/scripts")
             if scripts_dir.is_dir() and str(scripts_dir) not in sys.path:
                 sys.path.insert(0, str(scripts_dir))
-            from hermes_instar_decision_bridge import handle_text
+            try:
+                from hermes_instar_decision_bridge import handle_text
+            except ModuleNotFoundError as exc:
+                if exc.name == "hermes_instar_decision_bridge":
+                    return False
+                raise
 
             source = getattr(event, "source", None)
             result = handle_text(
@@ -9695,11 +9700,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
             await self._send_message_with_thread_fallback(**send_kwargs)
             return True
-        except ModuleNotFoundError as exc:
-            if exc.name in {"hermes_instar_decision_bridge", "instar_loop_decision"}:
-                return False
-            logger.warning("[%s] Instar loop decision handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
-            return True
         except Exception as exc:
             logger.warning("[%s] Instar loop decision handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
             return True
@@ -9717,7 +9717,12 @@ class TelegramAdapter(BasePlatformAdapter):
             scripts_dir = _Path("/home/info/scripts")
             if scripts_dir.is_dir() and str(scripts_dir) not in sys.path:
                 sys.path.insert(0, str(scripts_dir))
-            from hermes_instar_decision_bridge import handle_callback
+            try:
+                from hermes_instar_decision_bridge import handle_callback
+            except ModuleNotFoundError as exc:
+                if exc.name == "hermes_instar_decision_bridge":
+                    return False
+                raise
 
             query_message = getattr(query, "message", None)
             result = handle_callback(
@@ -9742,15 +9747,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     except (TypeError, ValueError):
                         pass
                 await self._send_message_with_thread_fallback(**send_kwargs)
-            return True
-        except ModuleNotFoundError as exc:
-            if exc.name in {"hermes_instar_decision_bridge", "instar_loop_decision"}:
-                return False
-            logger.warning("[%s] Instar loop callback handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
-            try:
-                await query.answer(text="Instar decision failed closed.")
-            except Exception:
-                pass
             return True
         except Exception as exc:
             logger.warning("[%s] Instar loop callback handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
