@@ -3,7 +3,11 @@ import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ChatSidebar } from "./ChatSidebar";
 import { EVENTS_CONNECT_TIMEOUT_MS } from "@/lib/events-reconnect";
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
 
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/events?channel=chat-1"),
@@ -131,8 +135,6 @@ afterEach(async () => {
 
 describe("ChatSidebar event socket", () => {
   it("routes loopback 4401 closes through stale-token recovery", async () => {
-    const { ChatSidebar } = await import("./ChatSidebar");
-
     await render(<ChatSidebar channel="chat-1" />);
 
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
@@ -161,7 +163,6 @@ describe("ChatSidebar event socket reconnect", () => {
   });
 
   async function renderSidebar() {
-    const { ChatSidebar } = await import("./ChatSidebar");
     await render(<ChatSidebar channel="chat-1" />);
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
   }
