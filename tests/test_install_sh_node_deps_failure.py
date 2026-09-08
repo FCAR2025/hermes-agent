@@ -28,6 +28,7 @@ def _run_node_deps_stage(
     hermes_home = tmp_path / "home"
     managed_bin = hermes_home / "bin"
     npm_calls = tmp_path / "npm-calls"
+    npm_args = tmp_path / "npm-args"
 
     tui_dir.mkdir(parents=True)
     bin_dir.mkdir()
@@ -49,6 +50,7 @@ if [ "${1:-}" = "--version" ]; then
     exit 0
 fi
 printf '%s\\n' "$PWD" >> "$NPM_CALLS"
+printf '%s\\t%s\\n' "$PWD" "$*" >> "$NPM_ARGS"
 if [ -n "${NPM_FAIL_DIRECTORY:-}" ] && [ "$PWD" = "$NPM_FAIL_DIRECTORY" ]; then
     echo "simulated npm lifecycle failure" >&2
     exit 37
@@ -64,6 +66,7 @@ exit 0
             "HERMES_HOME": str(hermes_home),
             "HERMES_INSTALL_DIR": str(install_dir),
             "NPM_CALLS": str(npm_calls),
+            "NPM_ARGS": str(npm_args),
             "NPM_FAIL_DIRECTORY": fail_directory or "",
             "PATH": f"{bin_dir}:{env['PATH']}",
         }
@@ -143,3 +146,11 @@ def test_node_dependency_success_remains_successful(tmp_path: Path) -> None:
     assert calls == [str(install_dir), str(install_dir / "ui-tui")]
     assert "Node.js dependencies installed" in proc.stdout
     assert "TUI dependencies installed" in proc.stdout
+
+
+def test_root_node_dependency_install_does_not_expand_workspaces(tmp_path: Path) -> None:
+    proc, install_dir, _ = _run_node_deps_stage(tmp_path, fail_directory=None)
+
+    assert proc.returncode == 0, proc.stderr
+    invocations = (tmp_path / "npm-args").read_text(encoding="utf-8").splitlines()
+    assert invocations[0] == f"{install_dir}\tinstall --silent --workspaces=false"

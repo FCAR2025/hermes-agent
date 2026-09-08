@@ -1047,24 +1047,16 @@ class TestPartialToolCallWarning:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_empty_partial_stream_stub_stays_empty_for_loop_guard(
+    def test_zero_char_partial_stream_raises_transport_error(
         self, mock_close, mock_create,
     ):
-        """Stream dies with 0 recovered chars and no tool call → the stub
-        keeps its empty content ON PURPOSE.
+        """Zero recovered chars and no tool call propagate the transport error.
 
-        The conversation loop's truncation path detects an EMPTY
-        partial-stream stub (PARTIAL_STREAM_STUB_ID + no content) and skips
-        appending it to history entirely — only the continuation nudge is
-        sent (the #68041 class fix).  An earlier iteration substituted
-        '[response interrupted]' placeholder text HERE, which defeated that
-        guard: the stub no longer looked empty, entered history, and the
-        placeholder leaked into the stitched final response.  Transcripts
-        that already carry a persisted empty turn are healed at the send
-        boundary by repair_empty_non_final_messages instead.
+        There is nothing useful to continue from, so returning an empty length
+        stub would make a dead transport look like a valid empty model turn and
+        feed the empty-response fallback/exhaustion loop.
         """
         from run_agent import AIAgent
-        from hermes_constants import PARTIAL_STREAM_STUB_ID
 
         class _StallError(RuntimeError):
             pass
@@ -1098,23 +1090,13 @@ class TestPartialToolCallWarning:
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
         _os.environ["HERMES_STREAM_RETRIES"] = "0"
         try:
-            response = agent._interruptible_streaming_api_call({})
+            with pytest.raises(_StallError, match="simulated upstream stall"):
+                agent._interruptible_streaming_api_call({})
         finally:
             if _prev is None:
                 _os.environ.pop("HERMES_STREAM_RETRIES", None)
             else:
                 _os.environ["HERMES_STREAM_RETRIES"] = _prev
-
-        # The stub must be RECOGNIZABLY empty so the loop guard can skip it.
-        assert getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-        content = response.choices[0].message.content
-        assert not content, (
-            f"Empty-partial-stream stub must keep empty content so the "
-            f"conversation loop's empty-stub guard can detect and skip it — "
-            f"substituted text defeats the guard and leaks into the final "
-            f"response. Got content={content!r}"
-        )
-        assert response.choices[0].message.tool_calls is None
 
 
 class TestSilentRetryMidToolCall:

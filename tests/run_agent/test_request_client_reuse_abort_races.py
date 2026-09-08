@@ -36,6 +36,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 
@@ -242,9 +243,12 @@ def test_stale_abort_is_atomic_with_holder_read(monkeypatch):
     ), patch.object(
         agent, "_replace_primary_openai_client"
     ):
-        response = agent._interruptible_streaming_api_call({})
+        with pytest.raises(
+            httpx.RemoteProtocolError,
+            match="stream attempt 1 was superseded",
+        ):
+            agent._interruptible_streaming_api_call({})
 
-    assert response is not None
     assert "stale_stream_kill" in abort_reasons
     # The atomicity contract: no owner-side close slipped in mid-abort.
     assert observed["worker_finished_during_abort"] is False

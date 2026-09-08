@@ -2,7 +2,14 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import { PTY_TICKET_TIMEOUT_MS } from "@/lib/pty-reconnect";
 
@@ -157,6 +164,7 @@ type CloseEventLike = {
 
 let container: HTMLDivElement;
 let root: Root;
+const { default: ChatPage } = await import("./ChatPage");
 
 // jsdom runs without an origin here (per-file @vitest-environment jsdom on a
 // node-default config), so localStorage is undefined. Stub it so components
@@ -256,8 +264,6 @@ afterEach(async () => {
 
 describe("ChatPage", () => {
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />
@@ -266,10 +272,13 @@ describe("ChatPage", () => {
 
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
 
-    FakeWebSocket.instances[0].onclose?.({
-      code: 4401,
-      reason: "auth: token_mismatch",
-      wasClean: true,
+    await act(async () => {
+      FakeWebSocket.instances[0].onclose?.({
+        code: 4401,
+        reason: "auth: token_mismatch",
+        wasClean: true,
+      });
+      await Promise.resolve();
     });
 
     expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
@@ -286,8 +295,6 @@ describe("ChatPage", () => {
       configurable: true,
       value: { addEventListener, removeEventListener, width: 1280 },
     });
-
-    const { default: ChatPage } = await import("./ChatPage");
 
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
@@ -325,7 +332,6 @@ describe("ChatPage", () => {
 
 describe("ChatPage side panel collapse", () => {
   async function renderChat() {
-    const { default: ChatPage } = await import("./ChatPage");
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />
@@ -386,7 +392,6 @@ describe("ChatPage PTY ticket connect deadline", () => {
   });
 
   async function renderChat() {
-    const { default: ChatPage } = await import("./ChatPage");
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />
@@ -448,7 +453,7 @@ describe("ChatPage PTY ticket connect deadline", () => {
   it("leaves a settled ticket's socket to the CONNECTING timer", async () => {
     await renderChat();
     await advance(0);
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    expect(FakeWebSocket.instances).toHaveLength(1);
 
     // NS-591 regression: once the socket exists the ticket deadline is
     // disarmed, so PTY_CONNECTING_TIMEOUT_MS stays the only thing that may
