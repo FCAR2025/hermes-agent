@@ -9666,7 +9666,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         try:
             scripts_dir = _Path("/home/info/scripts")
-            if str(scripts_dir) not in sys.path:
+            if scripts_dir.is_dir() and str(scripts_dir) not in sys.path:
                 sys.path.insert(0, str(scripts_dir))
             from hermes_instar_decision_bridge import handle_text
 
@@ -9695,6 +9695,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
             await self._send_message_with_thread_fallback(**send_kwargs)
             return True
+        except ModuleNotFoundError as exc:
+            if exc.name in {"hermes_instar_decision_bridge", "instar_loop_decision"}:
+                return False
+            logger.warning("[%s] Instar loop decision handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
+            return True
         except Exception as exc:
             logger.warning("[%s] Instar loop decision handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
             return True
@@ -9710,7 +9715,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Consume Instar inline decision buttons without touching other callbacks."""
         try:
             scripts_dir = _Path("/home/info/scripts")
-            if str(scripts_dir) not in sys.path:
+            if scripts_dir.is_dir() and str(scripts_dir) not in sys.path:
                 sys.path.insert(0, str(scripts_dir))
             from hermes_instar_decision_bridge import handle_callback
 
@@ -9737,6 +9742,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     except (TypeError, ValueError):
                         pass
                 await self._send_message_with_thread_fallback(**send_kwargs)
+            return True
+        except ModuleNotFoundError as exc:
+            if exc.name in {"hermes_instar_decision_bridge", "instar_loop_decision"}:
+                return False
+            logger.warning("[%s] Instar loop callback handler failed closed: %s", getattr(self, "name", "Telegram"), exc)
+            try:
+                await query.answer(text="Instar decision failed closed.")
+            except Exception:
+                pass
             return True
         except Exception as exc:
             logger.warning("[%s] Instar loop callback handler failed closed: %s", getattr(self, "name", "Telegram"), exc)

@@ -7,6 +7,7 @@ It never resolves Hermes /approve or /deny and never executes live side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import os
 from pathlib import Path
 import shlex
@@ -14,11 +15,17 @@ import sys
 from typing import Iterable, Literal
 
 SCRIPTS_DIR = Path("/home/info/scripts")
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+DEFAULT_GATEWAY_DIR = Path("/home/info/.omx/action-gateway")
 
-import fcar_action_gateway_contract as gateway_contract  # noqa: E402
-import fcar_action_gateway_review as gateway_review  # noqa: E402
+
+def _load_gateway_modules():
+    """Load the host-owned FCAR gateway implementation when it is installed."""
+    if SCRIPTS_DIR.is_dir() and str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    contract = importlib.import_module("fcar_action_gateway_contract")
+    review = importlib.import_module("fcar_action_gateway_review")
+    return contract, review
+
 
 CommandName = Literal["list", "status", "digest", "approve", "reject", "mock_readback"]
 
@@ -143,6 +150,7 @@ def _unauthorized_text(reviewer: str) -> str:
 
 
 def _queue_text(gateway_dir: Path) -> str:
+    _, gateway_review = _load_gateway_modules()
     summary = gateway_review.queue_summary(gateway_dir)
     pending = summary["pending_approvals"]
     lines = [
@@ -165,6 +173,7 @@ def _queue_text(gateway_dir: Path) -> str:
 
 
 def build_pending_digest(gateway_dir: Path | str) -> FCARGatewayDigest:
+    _, gateway_review = _load_gateway_modules()
     path = Path(gateway_dir)
     summary = gateway_review.queue_summary(path)
     pending = summary["pending_approvals"]
@@ -188,6 +197,7 @@ def build_pending_digest(gateway_dir: Path | str) -> FCARGatewayDigest:
 
 
 def _status_text(gateway_dir: Path) -> str:
+    gateway_contract, _ = _load_gateway_modules()
     status = gateway_contract.gateway_status(gateway_dir)
     audit = gateway_contract.audit_ledger(gateway_dir)
     return (
@@ -200,11 +210,13 @@ def _status_text(gateway_dir: Path) -> str:
 
 
 def _approval_id(*, reviewer: str, key: str) -> str:
+    gateway_contract, _ = _load_gateway_modules()
     safe_reviewer = "".join(ch for ch in reviewer if ch.isalnum() or ch in {"-", "_"}) or "operator"
     return f"fcar-gateway-dry-run:{safe_reviewer}:{gateway_contract.compute_payload_hash({'key': key})[-12:]}"
 
 
 def _approve_then_mock(gateway_dir: Path, key: str, reviewer: str) -> tuple[dict, dict]:
+    gateway_contract, _ = _load_gateway_modules()
     readback_probe = {
         "type": "mock_fcar_gateway_readback",
         "idempotency_key": key,
@@ -237,7 +249,7 @@ def _approve_then_mock(gateway_dir: Path, key: str, reviewer: str) -> tuple[dict
 def handle_fcar_gateway_command(
     text: str | None,
     *,
-    gateway_dir: Path | str = gateway_contract.DEFAULT_GATEWAY_DIR,
+    gateway_dir: Path | str = DEFAULT_GATEWAY_DIR,
     reviewer: str = "telegram-operator",
     allowed_reviewers: str | Iterable[str] | None = None,
 ) -> FCARGatewayCommandResult:
@@ -265,6 +277,7 @@ def handle_fcar_gateway_command(
             return FCARGatewayCommandResult(consumed=True, text=_unauthorized_text(reviewer))
 
         if parsed.command == "reject":
+            _, gateway_review = _load_gateway_modules()
             if len(parsed.args) < 2:
                 return FCARGatewayCommandResult(consumed=True, text="Missing key or reason.\n" + _usage())
             key = parsed.args[0]
