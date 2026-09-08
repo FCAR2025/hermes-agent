@@ -427,7 +427,16 @@ def _emit_action_gateway_dry_run(*, target: str, message: str, platform_name: st
         json.dumps(payload, ensure_ascii=False, sort_keys=True),
     ]
     try:
-        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        )
     except Exception as exc:
         return json.dumps(
             {
