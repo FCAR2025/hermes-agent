@@ -16,31 +16,14 @@ _REPO = str(Path(__file__).resolve().parents[2])
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-_SCRIPTS = "/home/info/scripts"
-if _SCRIPTS not in sys.path:
-    sys.path.insert(0, _SCRIPTS)
-
-import fcar_action_gateway_contract as gateway_contract  # noqa: E402
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 from gateway.platforms.base import MessageEvent, MessageType  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from tests.gateway.test_fcar_action_gateway_commands import gateway_double  # noqa: E402, F401
 
 
-def _seed_gateway(gateway_dir: Path) -> str:
-    key = "telegram-integration:fcar-gateway:pending:001"
-    gateway_contract.write_manifest(gateway_dir)
-    intent = gateway_contract.sample_intent(
-        intent_id="intent_telegram_integration_001",
-        agent="hermes",
-        surface="telegram-integration-test",
-        action_class="external_send",
-        channel="telegram",
-        payload={"message": "payload must not leak"},
-        idempotency_key=key,
-    )
-    gateway_contract.ingest_intents([intent], gateway_dir)
-    return key
+KEY = "telegram-test:fcar-gateway:pending:001"
 
 
 def _event(text: str) -> MessageEvent:
@@ -60,8 +43,8 @@ def _event(text: str) -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_maybe_handle_fcar_gateway_command_sends_review_response(tmp_path):
-    key = _seed_gateway(tmp_path)
+async def test_maybe_handle_fcar_gateway_command_sends_review_response(tmp_path, gateway_double):
+    key = KEY
     adapter = object.__new__(TelegramAdapter)
     adapter.config = PlatformConfig(enabled=True, token="test", extra={"fcar_action_gateway_dir": str(tmp_path)})
     adapter._send_message_with_thread_fallback = AsyncMock(return_value=SimpleNamespace(message_id=42))
@@ -109,8 +92,8 @@ async def test_handle_command_consumes_fcar_gateway_before_llm_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_maybe_handle_fcar_gateway_command_uses_fcar_operator_allowlist(tmp_path):
-    key = _seed_gateway(tmp_path)
+async def test_maybe_handle_fcar_gateway_command_uses_fcar_operator_allowlist(tmp_path, gateway_double):
+    key = KEY
     adapter = object.__new__(TelegramAdapter)
     adapter.config = PlatformConfig(
         enabled=True,
@@ -127,5 +110,5 @@ async def test_maybe_handle_fcar_gateway_command_uses_fcar_operator_allowlist(tm
     assert consumed is True
     kwargs = adapter._send_message_with_thread_fallback.await_args.kwargs
     assert "Dry-run approved" in kwargs["text"]
-    audit = gateway_contract.audit_ledger(tmp_path)
-    assert audit["status"] == "AUDIT_PASS"
+    gateway_double.contract.approve_dry_run.assert_called_once()
+    gateway_double.contract.execute_mock_readback.assert_called_once()
