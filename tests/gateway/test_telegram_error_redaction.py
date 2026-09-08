@@ -44,6 +44,25 @@ def _make_connected_adapter() -> TelegramAdapter:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('network_error', [True, False])
+async def test_polling_callback_redacts_transport_token(monkeypatch, caplog, network_error):
+    adapter = _make_bare_adapter()
+    monkeypatch.setattr(adapter, '_delete_webhook_best_effort', AsyncMock())
+    monkeypatch.setattr(adapter, '_start_polling_resilient', AsyncMock(return_value=False))
+    monkeypatch.setattr(adapter, '_recovery_in_flight', lambda: False)
+    monkeypatch.setattr(adapter, '_looks_like_polling_conflict', lambda error: False)
+    monkeypatch.setattr(adapter, '_looks_like_network_error', lambda error: network_error)
+    monkeypatch.setattr(adapter, '_handle_polling_network_error', AsyncMock())
+    monkeypatch.setattr(adapter, '_spawn_polling_recovery', lambda loop, task: task.close())
+    await adapter._start_polling_mode(is_reconnect=True)
+    caplog.clear()
+    with caplog.at_level('WARNING'):
+        adapter._polling_error_callback_ref(RuntimeError(f'polling failed: {_SECRET_URL}'))
+    assert caplog.records
+    assert _SECRET_TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_connect_failure_redacts_token_from_fatal_status(monkeypatch):
     """A connect()-time exception embedding the bot token URL must not reach
     the persisted fatal-error status or the log line unredacted."""
