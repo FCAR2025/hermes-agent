@@ -860,6 +860,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return rc
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    require_blocked_unclaimed = getattr(args, "if_blocked_unclaimed", False)
     # Handoff fields are per-run; refuse to copy them across N runs.
     if len(ids) > 1 and (summary or raw_meta):
         return _err("kanban: --summary / --metadata are per-task and can't be used "
@@ -878,9 +879,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
-            fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            if require_blocked_unclaimed:
+                fail_msg[tid] = f"cannot complete {tid}: task must still be blocked and unclaimed"
+            else:
+                fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+                                    expected_run_id=_worker_run_id_for(tid),
+                                    require_blocked_unclaimed=require_blocked_unclaimed)
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

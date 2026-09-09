@@ -10,7 +10,9 @@ def _snapshot(conn, task_id):
     return tuple(row) if row else None
 
 
-def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+def prepare_acceptance(
+    conn, task_id, expected_run_id, metadata, *, defer_contract_binding=False,
+):
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
@@ -21,23 +23,35 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
+    pending_contract = None
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
     if match and contract == match[1]:
-        with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
-                return False
-            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
-        contract = published_pr
-    return snapshot, collect_acceptance(contract, published_pr)
+        if defer_contract_binding:
+            pending_contract = published_pr
+        else:
+            with write_txn(conn):
+                if _snapshot(conn, task_id) != snapshot:
+                    return False
+                conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
+            snapshot = (run_id, status, published_pr)
+            contract = published_pr
+    return snapshot, collect_acceptance(contract, published_pr), pending_contract
 
 
 def record_acceptance(conn, task_id, acceptance):
     """Called under complete_task's write_txn, before its terminal UPDATE."""
     from hermes_cli.kanban_db import _append_event
-    snapshot, receipt = acceptance
+    snapshot, receipt, pending_contract = acceptance
     if _snapshot(conn, task_id) != snapshot:
         return False
+    if pending_contract is not None:
+        declared = _PR.fullmatch(pending_contract)
+        if declared is None or declared[1] != snapshot[2]:
+            return False
+        conn.execute(
+            "UPDATE tasks SET completion_contract=? WHERE id=?",
+            (pending_contract, task_id),
+        )
     _append_event(conn, task_id, "pr_acceptance", receipt, run_id=snapshot[0])
     if not receipt["ok"]:
         detail = f"PR acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
