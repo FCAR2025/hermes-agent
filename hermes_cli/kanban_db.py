@@ -2637,11 +2637,28 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _is_blocked_unclaimed(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        """
+        SELECT 1
+          FROM tasks
+         WHERE id = ?
+           AND status = 'blocked'
+           AND current_run_id IS NULL
+           AND worker_pid IS NULL
+           AND claim_lock IS NULL
+           AND claim_expires IS NULL
+        """,
+        (task_id,),
+    ).fetchone() is not None
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    require_blocked_unclaimed: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2659,25 +2676,42 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    Strict receipt completion remains mutation-free on rejection.
+    ``require_blocked_unclaimed`` is an opt-in terminal-receipt CAS: completion
+    proceeds only while the task is still blocked with no run or worker claim.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # Guard before every preparatory helper as well as in the terminal write
+    # transaction. Strict preparation below is read-only, so a claim racing
+    # this pre-check cannot leave acceptance bindings or audit events behind.
+    if require_blocked_unclaimed and not _is_blocked_unclaimed(conn, task_id):
+        return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    verified_cards = _gate_created_cards(
+        conn, task_id, created_cards, summary or result,
+        audit_failure=not require_blocked_unclaimed,
+    )
+    if not require_blocked_unclaimed:
+        _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(
+        conn, task_id, expected_run_id, metadata,
+        defer_contract_binding=require_blocked_unclaimed,
+    )
     if acceptance is False:
         return False
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if require_blocked_unclaimed and not _is_blocked_unclaimed(conn, task_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -2705,6 +2739,14 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
+        if require_blocked_unclaimed:
+            sql += (
+                " AND status = 'blocked'"
+                " AND current_run_id IS NULL"
+                " AND worker_pid IS NULL"
+                " AND claim_lock IS NULL"
+                " AND claim_expires IS NULL"
+            )
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -2749,23 +2791,25 @@ _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
 
 def _gate_created_cards(
     conn: sqlite3.Connection, task_id: str, created_cards: Optional[Iterable[str]], preview_text: Optional[str],
+    *, audit_failure: bool = True,
 ) -> list[str]:
     """Verify ``created_cards`` BEFORE the main write txn; returns the verified
-    ids. A phantom id is recorded in its own tiny txn (auditable) then raised
-    as :class:`HallucinatedCardsError` without touching task state."""
+    ids. With ``audit_failure``, a phantom id is recorded in its own tiny txn
+    before :class:`HallucinatedCardsError` is raised."""
     if not created_cards:
         return []
     verified_cards, phantom_cards = _verify_created_cards(conn, task_id, created_cards)
     if phantom_cards:
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "completion_blocked_hallucination",
-                {
-                    "phantom_cards": phantom_cards,
-                    "verified_cards": verified_cards,
-                    "summary_preview": _first_line(preview_text, 200) or None,
-                },
-            )
+        if audit_failure:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_hallucination",
+                    {
+                        "phantom_cards": phantom_cards,
+                        "verified_cards": verified_cards,
+                        "summary_preview": _first_line(preview_text, 200) or None,
+                    },
+                )
         raise HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
 

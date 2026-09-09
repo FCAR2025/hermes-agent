@@ -230,3 +230,30 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_blocked_unclaimed_completion_binds_accepted_pr_inside_terminal_transaction(github):
+    with connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="terminal receipt with governed publication",
+            completion_contract="acme/repo",
+            initial_status="blocked",
+        )
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"},
+            require_blocked_unclaimed=True,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.completion_contract == "https://github.com/acme/repo/pull/7"
+        assert conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,),
+        ).fetchone()[0] == 1
