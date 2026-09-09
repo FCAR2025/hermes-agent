@@ -83,7 +83,8 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # Forks do not inherit the upstream repository's larger-runner access.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code

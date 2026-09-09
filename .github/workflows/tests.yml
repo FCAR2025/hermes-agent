@@ -43,8 +43,9 @@ jobs:
     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
     # every slice agrees on the split without a planning job.
     name: Run tests (${{ matrix.slice }}/3)
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 30
+    # Forks do not inherit the upstream repository's larger-runner access.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +115,7 @@ jobs:
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/3
           HERMES_TEST_FORKSERVER: "1"
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 4 }}
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
