@@ -283,6 +283,8 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--if-blocked-unclaimed", action="store_true",
+             help="Complete only when the task is still blocked with no current run or worker claim"),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
