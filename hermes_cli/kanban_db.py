@@ -1303,6 +1303,9 @@ def create_task(
                     },
                 )
                 if task_status == "blocked":
+                    # Initial blocking is an operator hold, so make it sticky
+                    # in the same transaction that creates the task. Without
+                    # this event, the next dispatcher tick auto-promotes it.
                     _append_event(
                         conn,
                         task_id,
@@ -2042,8 +2045,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
-    1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).
+    1. The most recent block event was an explicit block or initial blocked
+    hold — those stay blocked until an explicit ``kanban_unblock`` (#28712).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
