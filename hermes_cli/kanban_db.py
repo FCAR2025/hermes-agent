@@ -1361,6 +1361,16 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # Initial blocking is an operator hold, so make it sticky
+                    # in the same transaction that creates the task. Without
+                    # this event, the next dispatcher tick auto-promotes it.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "initial_status", "source_status": "created"},
+                    )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1952,9 +1962,9 @@ def _synthesize_ended_run(
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
-    explicit ``kanban_block`` that must wait for an operator. A breaker trip
-    emits ``gave_up`` (not ``blocked``) and so auto-recovers, as does a task
-    with no such event at all (direct DB edit).
+    explicit ``kanban_block`` or initial blocked hold that must wait for an
+    operator. A breaker trip emits ``gave_up`` (not ``blocked``) and so
+    auto-recovers, as does a task with no such event at all (direct DB edit).
 
     See #28712.
     Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
@@ -2008,8 +2018,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
-    1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).
+    1. The most recent block event was an explicit block or initial blocked
+    hold — those stay blocked until an explicit ``kanban_unblock`` (#28712).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
