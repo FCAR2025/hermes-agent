@@ -154,6 +154,36 @@ class GatewayAgentCacheMixin:
             return
         override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
+        if provider and override.get("model"):
+            try:
+                from hermes_cli.model_switch import (
+                    ConfigLaneUnavailable, configured_anthropic_proxy_lane,
+                    is_claude_family_model, is_on_configured_lane, strip_anthropic_prefix,
+                )
+                if is_claude_family_model(override["model"]):
+                    try:
+                        lane = configured_anthropic_proxy_lane()
+                    except ConfigLaneUnavailable as exc:
+                        logger.warning(
+                            "config.yaml unreadable (%s); refusing to rehydrate persisted /model override for session=%s",
+                            exc, session_key,
+                        )
+                        return
+                    if lane is not None and not is_on_configured_lane(
+                        provider, lane, base_url=str(override.get("base_url") or ""),
+                        api_mode="",
+                    ):
+                        provider = lane.provider
+                        override.update(
+                            model=strip_anthropic_prefix(override["model"]),
+                            provider=lane.provider,
+                            base_url=lane.base_url,
+                        )
+                        store.set_model_override(session_key, {
+                            "model": override["model"], "provider": provider, "base_url": lane.base_url,
+                        })
+            except Exception:
+                logger.debug("Model override lane sanitation unavailable", exc_info=True)
         if provider:
             # Re-resolve credentials for the persisted provider. On failure (e.g. credentials removed
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime

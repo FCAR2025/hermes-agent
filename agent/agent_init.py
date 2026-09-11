@@ -1029,6 +1029,14 @@ def _init_fallback_chain(agent, fallback_model):
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
     agent._fallback_chain = _fallback_entries(fallback_model)
     agent._fallback_index = 0
+    # Empty-exhaustion circuit-breaker state (stall guard — see
+    # tests/run_agent/test_empty_exhaustion_stall.py).  Counts CONSECUTIVE turns
+    # that empty-exhausted the whole fallback chain (cross-turn; reset on success).
+    agent._consecutive_empty_exhaustions = getattr(agent, "_consecutive_empty_exhaustions", 0)
+    # Proxies/base_urls that empty-exhausted THIS turn — the fallback walker skips
+    # entries routed through them (proxy-diversity guard).  Cleared each turn by
+    # restore_primary_runtime().
+    agent._empty_exhausted_base_urls = getattr(agent, "_empty_exhausted_base_urls", set())
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None

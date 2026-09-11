@@ -28,6 +28,8 @@ export interface PluginManifest {
    * does not match. This protects against tampered plugin delivery.
    */
   integrity?: string;
+  /** Opt into a standalone product shell on the plugin's exact route. */
+  presentation?: "workspace";
   source: string;
 }
 

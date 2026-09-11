@@ -1186,6 +1186,9 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
+        marks = getattr(agent, "_empty_exhausted_base_urls", None)
+        if marks:
+            marks.clear()
         if provider_fallback_active:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):

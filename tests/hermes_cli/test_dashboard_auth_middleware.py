@@ -109,7 +109,6 @@ def test_gated_status_is_public(gated_app):
     "/api/config/schema",
     "/api/model/info",
     "/api/dashboard/themes",
-    "/api/dashboard/plugins",
 ])
 def test_other_public_api_paths_are_public_under_gate(gated_app, path):
     """The remaining ``PUBLIC_API_PATHS`` entries must also bypass the
@@ -132,6 +131,107 @@ def test_other_public_api_paths_are_public_under_gate(gated_app, path):
             f"{path} redirected to {location} — should be public, "
             "not bounced to /login"
         )
+
+
+def test_dashboard_plugin_discovery_requires_session_under_gate(gated_app):
+    """Gated discovery must attach a session so plugin-scoped responses filter."""
+    response = gated_app.get("/api/dashboard/plugins", follow_redirects=False)
+    assert response.status_code == 401
+
+
+class _PublicPluginAuthProvider(StubAuthProvider):
+    name = "fcar-command"
+    display_name = "FCAR Command"
+    public_auth_paths = (
+        "/api/plugins/fcar-command/auth/join",
+        "/api/plugins/fcar-command/auth/invitations/redeem",
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/plugins/fcar-command/auth/join"),
+        ("POST", "/api/plugins/fcar-command/auth/invitations/redeem"),
+    ],
+)
+def test_registered_provider_exact_plugin_auth_path_is_public(
+    gated_app, method, path
+):
+    register_provider(_PublicPluginAuthProvider())
+
+    response = gated_app.request(method, path, follow_redirects=False)
+
+    assert response.status_code not in {401, 302}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/plugins/fcar-command/auth/join/",
+        "/api/plugins/fcar-command/auth/join/extra",
+        "/api/plugins/fcar-command/auth/invitations",
+        "/api/plugins/fcar-command/status",
+        "/api/plugins/other/auth/join",
+        "/api/plugins/fcar-command/auth/%2e%2e/status",
+        "/api/plugins/fcar-command/auth%2fjoin",
+        "/api/config",
+    ],
+)
+def test_provider_public_auth_declaration_never_expands_to_prefixes(
+    gated_app, path
+):
+    register_provider(_PublicPluginAuthProvider())
+
+    response = gated_app.get(
+        path,
+        headers={"X-Hermes-Auth-Provider": "fcar-command"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "declaration", "attempted_path"),
+    [
+        (
+            "fcar-command",
+            ["/api/plugins/fcar-command/auth/join"],
+            "/api/plugins/fcar-command/auth/join",
+        ),
+        (
+            "fcar-command",
+            (
+                "/api/plugins/fcar-command/auth/join",
+                "/api/plugins/other/auth/join",
+            ),
+            "/api/plugins/fcar-command/auth/join",
+        ),
+        (
+            "bad/name",
+            ("/api/plugins/bad/name/auth/join",),
+            "/api/plugins/bad/name/auth/join",
+        ),
+        (
+            "fcar-command",
+            ("/api/plugins/fcar-command/auth/*",),
+            "/api/plugins/fcar-command/auth/join",
+        ),
+    ],
+)
+def test_malformed_provider_public_auth_declaration_fails_closed(
+    gated_app, provider_name, declaration, attempted_path
+):
+    class MalformedProvider(StubAuthProvider):
+        name = provider_name
+        public_auth_paths = declaration
+
+    register_provider(MalformedProvider())
+
+    response = gated_app.get(attempted_path, follow_redirects=False)
+
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -382,5 +482,3 @@ def test_all_providers_unreachable_returns_503(_gated_state):
     r = client.get("/api/auth/me")
     assert r.status_code == 503
     assert "unreachable" in r.text.lower()
-
-

@@ -19,6 +19,7 @@ from functools import wraps
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -97,7 +98,8 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+    ("kanban_task_snapshot", ("GET", "/v1/kanban/boards/{board_slug}/tasks/{task_id}")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -1146,9 +1148,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
+        self._systemd_socket_activation = _coerce_request_bool(
+            extra.get("systemd_socket_activation"), default=False)
+        fd_name = extra.get("systemd_fd_name", "")
+        self._systemd_fd_name = fd_name if isinstance(fd_name, str) else ""
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
-        self._site: Optional["web.TCPSite"] = None
+        self._site: Optional["web.BaseSite"] = None
         self._response_store = ResponseStore()
         _api_runs._initialize_run_state(self, store_factory=RunIdempotencyStore)
         self._session_db: Optional[Any] = None  # explicit override (tests/manual wiring)
@@ -1528,6 +1534,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            ("GET", "/v1/kanban/boards/{board_slug}/tasks/{task_id}", self._handle_kanban_task_snapshot),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2289,6 +2296,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         "cloud": "authenticated-gateway-rpc"}}},
             "endpoints": {name: {"method": m, "path": p} for name, (m, p) in _CAPABILITY_ENDPOINTS},
         })
+
+    @_require_auth
+    async def _handle_kanban_task_snapshot(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_snapshot import (
+            InvalidKanbanIdentifier, KanbanSnapshotError, read_kanban_task_snapshot)
+        try:
+            snapshot = read_kanban_task_snapshot(
+                request.match_info.get("board_slug", ""),
+                request.match_info.get("task_id", ""),
+            )
+        except InvalidKanbanIdentifier:
+            return web.json_response({"error": {"message": "Invalid Kanban identifier"}}, status=400)
+        except KanbanSnapshotError as exc:
+            return web.json_response(
+                {"error": {"message": "Kanban board or task not found"}},
+                status=getattr(exc, "http_status", 404),
+            )
+        except Exception:
+            return web.json_response({"error": {"message": "Kanban snapshot unavailable"}}, status=500)
+        return web.json_response(snapshot)
 
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
 
@@ -3881,6 +3908,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "`/platform resume api_server`.",
                 retryable=False)
             return False
+        activated_socket = None
+        if self._systemd_socket_activation:
+            try:
+                activated_socket = self._systemd_activated_socket()
+            except Exception:
+                self._set_fatal_error(
+                    "api_server_systemd_socket_invalid",
+                    "Invalid systemd socket activation for API server.",
+                    retryable=False,
+                )
+                return False
         try:
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,
@@ -3928,15 +3966,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # while both report success — disable. - Linux: SO_REUSEADDR only permits rebinding past
             # TIME_WAIT (a second live listener needs SO_REUSEPORT, never set), so keep the default
             # (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
+            self._site = (
+                web.SockSite(self._runner, activated_socket)
+                if activated_socket is not None
+                else web.TCPSite(
+                    self._runner, self._host, self._port,
+                    reuse_address=False if sys.platform == "darwin" else None)
+            )
             try:
                 await self._site.start()
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                if activated_socket is not None:
+                    activated_socket.close()
+                    self._set_fatal_error(
+                        "api_server_systemd_socket_invalid",
+                        "Invalid systemd socket activation for API server.",
+                        retryable=False,
+                    )
+                elif getattr(exc, "errno", None) == errno.EADDRINUSE:
                     # Config error: non-retryable, or the reconnect watcher leaks fds forever.
                     self._set_fatal_error(
                         # A port conflict is a configuration error, not a transient blip — another process
@@ -3962,8 +4012,36 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self.name, self._host, self._port, self._model_name)
             return True
         except Exception as e:
+            if activated_socket is not None:
+                activated_socket.close()
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    def _systemd_activated_socket(self) -> socket.socket:
+        """Validate and duplicate systemd's single inherited IPv4 listener."""
+        if (
+            sys.platform != "linux"
+            or not self._systemd_fd_name
+            or os.environ.get("LISTEN_PID") != str(os.getpid())
+            or os.environ.get("LISTEN_FDS") != "1"
+            or os.environ.get("LISTEN_FDNAMES") != self._systemd_fd_name
+        ):
+            raise ValueError("invalid activation metadata")
+        inherited = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            address = inherited.getsockname()
+            if (
+                inherited.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+                or inherited.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+                or not isinstance(address, tuple)
+                or len(address) != 2
+                or address != (self._host, self._port)
+            ):
+                raise ValueError("inherited descriptor does not match configured listener")
+            return inherited
+        except Exception:
+            inherited.close()
+            raise
 
     async def disconnect(self) -> None:
         """Stop the aiohttp server and release every owned resource, including the ResponseStore

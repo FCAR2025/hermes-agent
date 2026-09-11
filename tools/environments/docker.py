@@ -34,6 +34,8 @@ from tools.environments.remote_common import (
 
 logger = logging.getLogger(__name__)
 
+_PROFILE_MOUNTS_LABEL_KEY = "hermes-profile-mounts"
+
 # Docker Desktop install paths checked when 'docker' is not in PATH
 # (macOS Intel / Apple Silicon Homebrew / app bundle).
 _DOCKER_SEARCH_PATHS = [
@@ -514,7 +516,10 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
-        snap_compat: bool = False):
+        snap_compat: bool = False,
+        auto_mount_profile_files: bool = True):
+        if not isinstance(auto_mount_profile_files, bool):
+            raise TypeError("auto_mount_profile_files must be a boolean")
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -540,7 +545,8 @@ class DockerEnvironment(BaseEnvironment):
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
-        volume_args.extend(_readonly_skill_mount_args())
+        if auto_mount_profile_files:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -585,14 +591,16 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
-            _EGRESS_LABEL_KEY: egress_label}
+            _EGRESS_LABEL_KEY: egress_label,
+            _PROFILE_MOUNTS_LABEL_KEY: "on" if auto_mount_profile_files else "off"}
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
 
         reused = persist_across_processes and self._attach_existing_container(
-            task_label, profile_name, egress_label, network)
+            task_label, profile_name, egress_label,
+            "on" if auto_mount_profile_files else "off", network)
         if not reused:
             self._container_id = self._docker_run(cwd)
 
@@ -714,13 +722,15 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
 
-    def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
+    def _attach_existing_container(self, task_label, profile_name, egress_label,
+                                   profile_mounts_label, network: bool) -> bool:
         """Attach to a prior process's labeled container ("ONE long-lived container shared
         across sessions"; opt out via ``docker_persist_across_processes: false``).
         Network guard is lockdown-only: a bridge container under ``docker_network: false``
         is removed and recreated, but a ``none`` container under default config is kept so
         ``--network=none`` in extra args doesn't churn containers every startup."""
-        existing = self._find_reusable_container(task_label, profile_name, egress_label)
+        existing = self._find_reusable_container(
+            task_label, profile_name, egress_label, profile_mounts_label)
         if existing is None:
             return False
         container_id, state = existing
@@ -883,7 +893,8 @@ class DockerEnvironment(BaseEnvironment):
         existing = self._find_reusable_container(
             self._labels.get("hermes-task-id", ""),
             self._labels.get("hermes-profile", ""),
-            self._labels.get(_EGRESS_LABEL_KEY, "off"))
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_PROFILE_MOUNTS_LABEL_KEY, "on"))
         if existing is not None:
             cid, state = existing
             if state == "running":
@@ -964,7 +975,8 @@ class DockerEnvironment(BaseEnvironment):
         return (result.stdout.strip() or None) if result is not None else None
 
     def _find_reusable_container(
-        self, task_label: str, profile_label: str, egress_label: str) -> Optional[tuple[str, str]]:
+        self, task_label: str, profile_label: str, egress_label: str,
+        profile_mounts_label: str) -> Optional[tuple[str, str]]:
         """``(container_id, state)`` of an existing container labeled for this task/profile/
         egress posture, or ``None`` on miss or any failure. The egress posture is a label
         FILTER for every posture, "off" included: a container built with egress on must not be
@@ -975,7 +987,8 @@ class DockerEnvironment(BaseEnvironment):
             "--filter", "label=hermes-agent=1",
             "--filter", f"label=hermes-task-id={task_label}",
             "--filter", f"label=hermes-profile={profile_label}",
-            "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"]
+            "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}",
+            "--filter", f"label={_PROFILE_MOUNTS_LABEL_KEY}={profile_mounts_label}"]
         result = _docker_query(
             [self._docker_exe, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
             fail="docker ps probe failed: %s — will start a fresh container",

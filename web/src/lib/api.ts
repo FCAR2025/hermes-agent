@@ -1353,6 +1353,7 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+  surface: string;
 }
 
 export interface ActionResponse {

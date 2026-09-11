@@ -62,6 +62,79 @@ class AnthropicTransport(ProviderTransport):
             **{key: params.get(key, default) for key, default in _BUILD_KWARG_DEFAULTS.items()},
         )
 
+    @staticmethod
+    def _reparse_sse_to_messages(raw: Any):
+        """Reconstruct a Messages-like object from a raw Anthropic SSE body."""
+        import json as _json
+        from types import SimpleNamespace as _NS
+
+        if not isinstance(raw, str) or "data:" not in raw:
+            return None
+        events = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                events.append(_json.loads(payload))
+            except Exception:
+                continue
+        if not events:
+            return None
+
+        blocks, stop_reason, saw_message = {}, None, False
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "message_start":
+                saw_message = True
+            elif event_type == "content_block_start":
+                index = event.get("index", 0)
+                block = event.get("content_block", {}) or {}
+                blocks[index] = {
+                    "type": block.get("type", "text"), "text": block.get("text", "") or "",
+                    "thinking": block.get("thinking", "") or "", "name": block.get("name"),
+                    "id": block.get("id"),
+                    "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                    "input_json": "",
+                }
+            elif event_type == "content_block_delta":
+                index = event.get("index", 0)
+                delta = event.get("delta", {}) or {}
+                block = blocks.setdefault(index, {
+                    "type": "text", "text": "", "thinking": "", "name": None,
+                    "id": None, "input": {}, "input_json": "",
+                })
+                if delta.get("type") == "text_delta":
+                    block["text"] += delta.get("text", "") or ""
+                elif delta.get("type") == "thinking_delta":
+                    block["thinking"] += delta.get("thinking", "") or ""
+                elif delta.get("type") == "input_json_delta":
+                    block["input_json"] += delta.get("partial_json", "") or ""
+            elif event_type == "message_delta":
+                stop_reason = (event.get("delta", {}) or {}).get("stop_reason") or stop_reason
+        if not saw_message and not blocks:
+            return None
+
+        out = []
+        for index in sorted(blocks):
+            block = blocks[index]
+            if block["type"] == "thinking":
+                out.append(_NS(type="thinking", thinking=block["thinking"]))
+            elif block["type"] == "tool_use":
+                tool_input = block["input"]
+                if not tool_input and block["input_json"]:
+                    try:
+                        tool_input = _json.loads(block["input_json"])
+                    except Exception:
+                        tool_input = {}
+                out.append(_NS(type="tool_use", name=block["name"], id=block["id"], input=tool_input))
+            else:
+                out.append(_NS(type="text", text=block["text"]))
+        return _NS(content=out, stop_reason=stop_reason or "end_turn", usage=None)
+
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Parse content blocks (text/thinking/tool_use), map stop_reason, collect reasoning_details."""
         import json
@@ -71,7 +144,21 @@ class AnthropicTransport(ProviderTransport):
         # Anthropic signs each thinking block against the blocks PRECEDING it; when thinking
         # interleaves with tool_use the parallel lists lose that order and replay -> HTTP 400.
         ordered_blocks = []
-        for block in response.content:
+        content_blocks = getattr(response, "content", None)
+        if not isinstance(content_blocks, list):
+            reparsed = self._reparse_sse_to_messages(response)
+            if reparsed is not None:
+                response = reparsed
+                content_blocks = reparsed.content
+            if not isinstance(content_blocks, list):
+                snippet = repr(response)
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
+                raise TypeError(
+                    "AnthropicTransport.normalize_response expected a Messages object "
+                    f"with a list `.content`; got {type(response).__name__}: {snippet}"
+                )
+        for block in content_blocks:
             block_dict = _to_plain_data(block)
             # Sanitize at capture so output-only SDK fields never persist and replay (400).
             clean_block = _sanitize_replay_block(block_dict) if isinstance(block_dict, dict) else None

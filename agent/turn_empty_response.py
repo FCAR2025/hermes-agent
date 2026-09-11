@@ -266,6 +266,7 @@ def recover_empty_response(
 
     # Exhausted retries — try the next provider in the chain before "(empty)".
     if _truly_empty and agent._fallback_chain:
+        agent._mark_proxy_empty_exhausted(getattr(agent, "base_url", ""))
         logger.warning(
             "Empty response after %d retries — attempting fallback (model=%s, provider=%s)",
             agent._empty_content_retries, agent.model, agent.provider,
@@ -285,5 +286,7 @@ def recover_empty_response(
             return _verdict("continue")
 
     _turn_exit_reason = "empty_response_exhausted"
+    agent._note_empty_exhaustion()
+    agent._mark_proxy_empty_exhausted(getattr(agent, "base_url", ""))
     final_response = _terminal_empty(agent, assistant_message, finish_reason, messages)
     return _verdict("break")

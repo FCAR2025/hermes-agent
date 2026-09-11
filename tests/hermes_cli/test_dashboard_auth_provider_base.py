@@ -38,6 +38,25 @@ def test_session_has_required_fields():
     assert s.expires_at == 1234567890
 
 
+def test_session_defaults_to_full_dashboard_surface():
+    s = Session(
+        user_id="u1",
+        email="a@b.com",
+        display_name="A",
+        org_id="org_1",
+        provider="test",
+        expires_at=1234567890,
+        access_token="at",
+        refresh_token="rt",
+    )
+
+    assert s.surface == "dashboard"
+
+
+def test_provider_has_no_public_plugin_auth_paths_by_default():
+    assert _CompliantProvider().public_auth_paths == ()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -123,5 +142,3 @@ def test_registry_lists_in_registration_order():
     register_provider(B())
     names = [p.name for p in list_providers()]
     assert names == ["a", "b"]
-
-

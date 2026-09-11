@@ -1825,6 +1825,14 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+EMPTY_EXHAUSTION_BREAKER_THRESHOLD = 3
+
+
+def should_return_partial_stub(partial_text, partial_tool_names) -> bool:
+    """Return whether a failed stream recovered content worth continuing."""
+    return bool(partial_tool_names) or bool(partial_text and str(partial_text).strip())
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
@@ -1872,6 +1880,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
 
             fb_base_url = str(fb_client.base_url)
+            exhausted_proxies = getattr(agent, "_empty_exhausted_base_urls", None) or set()
+            if fb_base_url.rstrip("/").lower() in exhausted_proxies:
+                logger.warning(
+                    "Fallback skip: %s/%s is on empty-exhausted proxy %s",
+                    fb_provider, fb_model, fb_base_url,
+                )
+                try:
+                    fb_client.close()
+                except Exception:
+                    pass
+                continue
             from hermes_cli.providers import is_actual_route
             if is_actual_route(fb_provider, fb_base_url):
                 fb_api_mode = "chat_completions"
@@ -3263,6 +3282,12 @@ class _StreamingCall(StreamingWaitMonitor):
         error = self.result["error"]
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
+        if not should_return_partial_stub(_partial_text, _partial_names):
+            logger.warning(
+                "Partial stream failed without recovered text or tool calls; raising transport error: %s",
+                error,
+            )
+            raise error
         if _partial_names:
             # User-visible warning so the user and model both know what was attempted.
             _name_str = ", ".join(_partial_names[:3])

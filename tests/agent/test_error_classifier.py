@@ -931,6 +931,39 @@ class TestClassifyApiError:
 
 
 
+    def test_anthropic_too_complex_timeout_is_context_overflow(self):
+        """The Anthropic 'timeout_error: operation may have been too complex.
+        Try a simpler request.' must route to context_overflow (compress + retry
+        PRIMARY), NOT a transient timeout that cascades to the fallback pond.
+        Genesis of the 2026-06-07 stall."""
+        e = MockAPIError(
+            "Request timed out. The operation may have been too complex. "
+            "Try a simpler request."
+        )
+        result = classify_api_error(e, provider="custom", model="claude-opus-4-8")
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+    def test_plain_network_timeout_stays_timeout_not_overflow(self):
+        """A bare network timeout (no 'too complex') must remain a transient
+        timeout — the override is narrow, not a blanket 'all timeouts compress'."""
+        e = Exception("request timed out")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
+
+    def test_bare_too_complex_substring_does_not_force_compress(self):
+        """Narrowing guard: a bare 'too complex' in an unrelated error (e.g. a
+        regex/query validation message) must NOT match the Anthropic timeout
+        override — only the full distinctive phrasing does."""
+        e = MockAPIError("validation error: this regex pattern is too complex",
+                         status_code=400)
+        result = classify_api_error(e)
+        assert not (result.reason == FailoverReason.context_overflow
+                    and result.should_compress), (
+            "bare 'too complex' substring wrongly forced compression"
+        )
+
     # ── Message-only usage limit disambiguation (no status code) ──
 
 

@@ -4405,7 +4405,7 @@ class TestPluginAPIAuth:
 
 class TestDashboardPluginManifestExtensions:
     """Tests for the extended plugin manifest fields (tab.override,
-    tab.hidden, slots) read by _discover_dashboard_plugins()."""
+    tab.hidden, slots, presentation) read by _discover_dashboard_plugins()."""
 
     def _write_plugin(self, tmp_path, name, manifest):
         import json
@@ -4431,6 +4431,31 @@ class TestDashboardPluginManifestExtensions:
         assert entry["tab"]["override"] == "/"
         assert entry["tab"]["hidden"] is True
         assert entry["slots"] == ["sidebar", "header-left"]
+
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [("workspace", "workspace"), ("sidebar", None), (42, None)],
+    )
+    def test_workspace_presentation_is_closed_to_known_value(
+        self, tmp_path, monkeypatch, declared, expected
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_plugin(
+            tmp_path,
+            "workspace-plugin",
+            {
+                "name": "workspace-plugin",
+                "label": "Workspace Plugin",
+                "tab": {"path": "/workspace-plugin"},
+                "entry": "dist/index.js",
+                "presentation": declared,
+            },
+        )
+        from hermes_cli import web_server
+
+        plugins = web_server._discover_dashboard_plugins()
+        entry = next(p for p in plugins if p["name"] == "workspace-plugin")
+        assert entry.get("presentation") == expected
 
     def test_user_plugins_ignore_profile_home_override(self, tmp_path, monkeypatch):
         """Regression: user dashboard extensions are a dashboard-owned asset

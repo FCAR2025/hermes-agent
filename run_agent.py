@@ -755,6 +755,20 @@ class AIAgent(
             if not enabled:
                 return
 
+        if self._empty_exhaustion_breaker_tripped():
+            logger.warning(
+                "bg-review skipped: empty-exhaustion breaker tripped (%d consecutive exhaustions)",
+                getattr(self, "_consecutive_empty_exhaustions", 0),
+            )
+            return
+        try:
+            restored = self._restore_primary_runtime()
+        except Exception:
+            restored = False
+        if not restored and getattr(self, "_fallback_activated", False):
+            logger.warning("bg-review skipped: primary runtime restore failed while fallback remains active")
+            return
+
         # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
         # alias the live history's nested tool_calls/content.
         # Structural clone at the single chokepoint every review path (automatic, /refine, idle-queue
@@ -1211,6 +1225,25 @@ class AIAgent(
         See #17446.
         """
         return getattr(self, "_fallback_index", 0) < len(getattr(self, "_fallback_chain", None) or [])
+
+    def _note_empty_exhaustion(self) -> None:
+        self._consecutive_empty_exhaustions = getattr(self, "_consecutive_empty_exhaustions", 0) + 1
+
+    def _reset_empty_exhaustion(self) -> None:
+        self._consecutive_empty_exhaustions = 0
+
+    def _empty_exhaustion_breaker_tripped(self) -> bool:
+        from agent.chat_completion_helpers import EMPTY_EXHAUSTION_BREAKER_THRESHOLD
+        return getattr(self, "_consecutive_empty_exhaustions", 0) >= EMPTY_EXHAUSTION_BREAKER_THRESHOLD
+
+    def _mark_proxy_empty_exhausted(self, base_url) -> None:
+        if not base_url:
+            return
+        marks = getattr(self, "_empty_exhausted_base_urls", None)
+        if marks is None:
+            marks = set()
+            self._empty_exhausted_base_urls = marks
+        marks.add(str(base_url).rstrip("/").lower())
 
     _restore_primary_runtime = _forward("agent.agent_runtime_helpers", "restore_primary_runtime")
     _try_recover_primary_transport = _forward("agent.agent_runtime_helpers", "try_recover_primary_transport")

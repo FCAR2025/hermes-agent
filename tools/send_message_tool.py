@@ -199,10 +199,72 @@ def _handle_react(args, remove=False):
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
+def _action_gateway_dry_run_enabled() -> bool:
+    return os.getenv("FCAR_ACTION_GATEWAY_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_action_gateway_dry_run(*, target: str, message: str, platform_name: str) -> str:
+    """Queue a Hermes send intent without resolving credentials or calling an adapter."""
+    import hashlib
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(os.getenv("FCAR_ACTION_GATEWAY_CLI", "/home/info/scripts/fcar_action_gateway_contract.py"))
+    gateway_dir = os.getenv("FCAR_ACTION_GATEWAY_DIR", "/home/info/.omx/action-gateway")
+    surface = os.getenv("FCAR_ACTION_GATEWAY_SURFACE", "hermes-send_message")
+    session_id = os.getenv("FCAR_ACTION_GATEWAY_SESSION_ID", "hermes-send-message-dry-run")
+    idempotency_key = os.getenv("FCAR_ACTION_GATEWAY_IDEMPOTENCY_KEY")
+    if not idempotency_key:
+        digest_source = json.dumps(
+            {"target": target, "message": message, "platform": platform_name},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        idempotency_key = "hermes:send_message:" + hashlib.sha256(digest_source.encode()).hexdigest()[:24]
+    if not script.exists():
+        return json.dumps({
+            "error": f"FCAR Action Gateway CLI not found: {script}",
+            "action_gateway_dry_run": True, "sent": False,
+        })
+
+    payload = {
+        "target": target, "message": message, "platform": platform_name,
+        "source_tool": "hermes.send_message", "dry_run_only": True,
+    }
+    cmd = [
+        sys.executable, str(script), "--gateway-dir", gateway_dir,
+        "--emit-agent", "hermes", "--emit-surface", surface,
+        "--session-id", session_id, "--action-class", "external_send",
+        "--channel", platform_name or "messaging", "--idempotency-key", idempotency_key,
+        "--payload-json", json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    ]
+    try:
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=15, check=False)
+    except Exception as exc:
+        return json.dumps({"error": f"FCAR Action Gateway dry-run emit failed: {exc}",
+                           "action_gateway_dry_run": True, "sent": False})
+    try:
+        gateway_result = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        gateway_result = {"raw_stdout": proc.stdout[:4000]}
+    response = {"action_gateway_dry_run": True, "sent": False,
+                "exit_code": proc.returncode, "gateway_result": gateway_result}
+    if proc.stderr.strip():
+        response["stderr"] = _sanitize_error_text(proc.stderr.strip())[:4000]
+    if proc.returncode != 0:
+        response["error"] = "FCAR Action Gateway dry-run emit returned non-zero"
+    return json.dumps(response)
+
+
 def _handle_send(args):
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+    if _action_gateway_dry_run_enabled():
+        return _emit_action_gateway_dry_run(
+            target=target, message=message, platform_name=target.partition(":")[0].strip().lower()
+        )
     platform_name, chat_id, thread_id, resolution_error = _resolve_tool_target(target)
     if resolution_error:
         return tool_error(resolution_error)

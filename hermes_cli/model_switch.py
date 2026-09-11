@@ -1025,6 +1025,81 @@ def _moa_default_preset() -> str:
         return "default"
 
 
+class ConfigLaneUnavailable(RuntimeError):
+    """The existing config document could not be read safely."""
+
+
+class ProxyLane(NamedTuple):
+    provider: str
+    base_url: str
+    api_mode: str
+    api_key: str
+
+
+_CLAUDE_FAMILY_RE = re.compile(r"^(anthropic/)?(claude|fable|opus|sonnet|haiku)([-_.:]|$)")
+_ANTHROPIC_PREFIX_RE = re.compile(r"^anthropic/", re.IGNORECASE)
+_ANTHROPIC_API_MODES = frozenset({"anthropic_messages", "anthropic-messages", "anthropic", "messages"})
+_CONFIG_UNREADABLE_MSG = "config.yaml unreadable — refusing to route a Claude model off the configured lane"
+
+
+def is_claude_family_model(name: str) -> bool:
+    return bool(_CLAUDE_FAMILY_RE.match(str(name or "").strip().lower()))
+
+
+def strip_anthropic_prefix(name: str) -> str:
+    return _ANTHROPIC_PREFIX_RE.sub("", str(name or "").strip())
+
+
+def _read_raw_config_document() -> dict:
+    import yaml
+    from hermes_cli.config import get_config_path
+
+    try:
+        path = get_config_path()
+        with open(path, "r", encoding="utf-8") as fh:
+            document = yaml.safe_load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
+    except Exception as exc:
+        raise ConfigLaneUnavailable(str(exc) or type(exc).__name__) from exc
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        raise ConfigLaneUnavailable(f"config.yaml is a {type(document).__name__}, not a mapping")
+    return document
+
+
+def configured_anthropic_proxy_lane() -> Optional[ProxyLane]:
+    model_cfg = _read_raw_config_document().get("model")
+    if not isinstance(model_cfg, dict):
+        return None
+    provider = str(model_cfg.get("provider") or "").strip()
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    api_mode = str(model_cfg.get("api_mode") or "").strip().lower()
+    if provider.lower() != "custom" and not provider.lower().startswith("custom:"):
+        return None
+    if not base_url or api_mode not in _ANTHROPIC_API_MODES:
+        return None
+    raw_key = str(model_cfg.get("api_key") or "").strip()
+    api_key = _scoped_key_env(raw_key[2:-1]) if raw_key.startswith("${") and raw_key.endswith("}") else raw_key
+    return ProxyLane(provider, base_url, "anthropic_messages", api_key)
+
+
+def is_on_configured_lane(
+    provider: str,
+    lane: ProxyLane,
+    *,
+    base_url: str = "",
+    api_mode: str = "",
+) -> bool:
+    provider_matches = str(provider or "").strip().lower() == lane.provider.strip().lower()
+    origin_matches = bool(base_url) and base_url_origin(base_url) == base_url_origin(lane.base_url)
+    mode_matches = str(api_mode or "").strip().lower() == lane.api_mode
+    return provider_matches and origin_matches and mode_matches
+
+
 @dataclass
 class _Switch:
     """Mutable state threaded through the ``switch_model`` steps.
@@ -1052,6 +1127,7 @@ class _Switch:
     validation_headers: dict = field(default_factory=dict)
     suppress_ollama_headers: bool = False
     validation: dict = field(default_factory=dict)
+    endpoint_pin: Optional[ProxyLane] = None
 
     def fail(self, message: str, **fields) -> ModelSwitchResult:
         return ModelSwitchResult(success=False, is_global=self.is_global, error_message=message, **fields)
@@ -1335,7 +1411,11 @@ def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
     final (provider, base_url) before validation."""
     st.provider_label = _switch_provider_label(st)
     st.api_key, st.base_url = st.current_api_key, st.current_base_url
-    if st.provider_changed or st.explicit_provider:
+    if st.endpoint_pin is not None:
+        st.api_key = st.endpoint_pin.api_key or "no-key-required"
+        st.base_url = st.endpoint_pin.base_url
+        st.api_mode = st.endpoint_pin.api_mode
+    elif st.provider_changed or st.explicit_provider:
         fail = _creds_for_switched_provider(st)
         if fail is not None:
             return fail
@@ -1487,7 +1567,23 @@ def switch_model(
         explicit_provider=explicit_provider, user_providers=user_providers, custom_providers=custom_providers,
         new_model=raw_input.strip(), target_provider=current_provider)
     route = _route_explicit_provider if explicit_provider else _route_from_model_input
-    for step in (route, _resolve_switch_credentials, _validate_switch):
+    fail = route(st)
+    if fail is not None:
+        return fail
+    if is_claude_family_model(st.new_model):
+        try:
+            lane = configured_anthropic_proxy_lane()
+        except ConfigLaneUnavailable:
+            return st.fail(_CONFIG_UNREADABLE_MSG)
+        if lane is not None:
+            st.endpoint_pin = lane
+            if not is_on_configured_lane(
+                st.target_provider, lane, base_url=st.current_base_url,
+                api_mode=determine_api_mode(st.target_provider, st.current_base_url),
+            ):
+                st.target_provider = lane.provider
+                st.new_model = strip_anthropic_prefix(st.new_model)
+    for step in (_resolve_switch_credentials, _validate_switch):
         fail = step(st)
         if fail is not None:
             return fail

@@ -594,12 +594,64 @@ def _resolve_config_cwd(env_type: str, mount_docker_cwd: bool) -> tuple:
     return cwd, host_cwd
 
 
+def _terminal_bool_config_value(terminal_config, config_key: str, env_name: str, *, default: bool) -> bool:
+    if isinstance(terminal_config, dict) and config_key in terminal_config:
+        value = terminal_config[config_key]
+        if not isinstance(value, bool):
+            raise TypeError(f"terminal.{config_key} must be a boolean")
+        return value
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"{env_name} must be a boolean")
+
+
+def _strict_terminal_config() -> dict:
+    """Read an existing config document without tolerant fallback."""
+    from hermes_cli.config import fast_safe_load, get_config_path
+
+    path = get_config_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = fast_safe_load(handle)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise RuntimeError(f"config.yaml unreadable: {exc}") from exc
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        raise RuntimeError(f"config.yaml unreadable: expected mapping, got {type(document).__name__}")
+    terminal = document.get("terminal", {})
+    if terminal is None:
+        return {}
+    if not isinstance(terminal, dict):
+        raise RuntimeError("config.yaml unreadable: terminal must be a mapping")
+    return terminal
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Resolve the terminal configuration dict from TERMINAL_* env vars."""
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
     env_type = _tenv("TERMINAL_ENV", "local")
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    raw_terminal_config = {}
+    if env_type == "docker":
+        raw_terminal_config = _strict_terminal_config()
+    docker_auto_mount_profile_files = _terminal_bool_config_value(
+        raw_terminal_config, "docker_auto_mount_profile_files",
+        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", default=True,
+    ) if env_type == "docker" else True
+    docker_network = _terminal_bool_config_value(
+        raw_terminal_config if env_type == "docker" else {}, "docker_network",
+        "TERMINAL_DOCKER_NETWORK", default=True,
+    )
 
     # Container/docker-only payloads are parsed only when such a backend is
     # selected: a stale or invalid Docker value bridged from config.yaml must
@@ -655,8 +707,9 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
+        "docker_auto_mount_profile_files": docker_auto_mount_profile_files,
         "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
-        "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
+        "docker_network": docker_network,
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
         # Cross-process reuse: attach to a labeled container at startup

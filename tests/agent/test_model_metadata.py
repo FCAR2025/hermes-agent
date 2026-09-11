@@ -1154,6 +1154,14 @@ class TestGetModelContextLength:
             )
             assert ctx2 == 1000000, f"Expected 1000000, got {ctx2}"
 
+            # Claude Code's bare Fable alias is the current Fable 5.1 route.
+            # It must not miss the catalog and silently fall back to 256K.
+            ctx_fable = get_model_context_length(
+                "fable",
+                base_url="https://my-gateway.example.com/v1/claude",
+            )
+            assert ctx_fable == 1000000, f"Expected 1000000, got {ctx_fable}"
+
             # An unknown model on a custom endpoint should still fall back
             # to 256K (no catalog match).
             ctx3 = get_model_context_length(
