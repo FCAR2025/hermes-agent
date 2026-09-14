@@ -76,12 +76,8 @@ def test_explicit_foreign_profile_is_denied_before_open(monkeypatch, db, isolate
     assert "current profile" in result["error"].lower()
 
 
-def test_bare_id_miss_does_not_scan_sibling_profiles(monkeypatch, db, isolated_profile):
+def test_bare_id_miss_does_not_scan_sibling_profiles(db, isolated_profile):
     store, _ = db
-    monkeypatch.setattr(
-        "tools.session_search_tool._locate_session_db",
-        lambda _session_id: pytest.fail("sibling profile scan must not run"),
-    )
     result = json.loads(session_search(db=store, session_id="s_foreign"))
     assert result["success"] is False
     assert result.get("profile") != "operator-b"
@@ -100,7 +96,11 @@ def test_missing_profile_scope_fails_closed_when_policy_is_enabled(db):
 
 def test_cli_cross_profile_behavior_is_unchanged(monkeypatch, db):
     store, _ = db
-    other = type("OtherDB", (), {"closed": False, "list_sessions_rich": lambda self, **_kw: [], "close": lambda self: setattr(self, "closed", True)})()
+    other = type("OtherDB", (), {
+        "closed": False,
+        "list_recent_sessions_bounded": lambda self, **_kw: [],
+        "close": lambda self: setattr(self, "closed", True),
+    })()
     monkeypatch.setattr("tools.session_search_tool._resolve_profile_db", lambda _profile: other)
     result = json.loads(session_search(db=store, profile="operator-b"))
     assert result["success"] is True

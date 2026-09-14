@@ -481,10 +481,20 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    from gateway.session_context import current_profile_only, get_session_env
+    restricted_to_current = current_profile_only()
+    if restricted_to_current:
+        bound_profile = get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        requested_profile = str(profile or "").strip()
+        if not bound_profile:
+            return tool_error("Session search requires a bound profile scope", success=False)
+        if requested_profile and requested_profile != bound_profile:
+            return tool_error("Session search is restricted to the current profile", success=False)
+        profile = bound_profile
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
-        profile_db = _resolve_profile_db(profile)
+        profile_db = None if restricted_to_current else _resolve_profile_db(profile)
     except Exception as e:
         return tool_error(f"profile '{profile}': {e}", success=False)
     if profile_db is not None:

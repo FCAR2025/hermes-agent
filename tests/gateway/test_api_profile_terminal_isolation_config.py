@@ -3,6 +3,7 @@
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from tools import terminal_tool
+from tools.terminal_tool_backends import _container_config_from_config
 
 
 def test_named_api_profile_reads_explicit_false_isolation_flags(tmp_path, monkeypatch):
@@ -28,7 +29,7 @@ def test_named_api_profile_reads_explicit_false_isolation_flags(tmp_path, monkey
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     with adapter._profile_scope("fcar-owner"):
         config = terminal_tool._get_env_config()
-        container_config = terminal_tool._container_config_from_config(config)
+        container_config = _container_config_from_config(config)
 
     assert container_config["docker_auto_mount_profile_files"] is False
     assert container_config["docker_network"] is False

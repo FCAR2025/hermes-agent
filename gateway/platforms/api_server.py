@@ -1150,6 +1150,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
+        self._current_profile_only = self._resolve_current_profile_only()
         self._systemd_socket_activation = _coerce_request_bool(
             extra.get("systemd_socket_activation"), default=False)
         fd_name = extra.get("systemd_fd_name", "")
@@ -3607,10 +3608,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return None
 
     @staticmethod
+    def _resolve_current_profile_only() -> bool:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        value = ((config.get("gateway") or {}).get("api_server") or {}).get(
+            "current_profile_only", False)
+        return value is True
+
+    @staticmethod
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
         browser_control_principal: str = "", browser_control_transport_family: str = "",
-        session_history_delivery: str = "") -> list:
+        session_history_delivery: str = "", current_profile_only: bool = False) -> list:
         """Bind an API turn with push disabled and history delivery default-denied.
 
         Only routes whose continuation reads SessionDB may pass "1". An omitted
@@ -3624,7 +3634,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             profile=profile, browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
-            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
+            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery,
+            current_profile_only=current_profile_only)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[Dict[str, Any]], requested_runtime: Optional[Dict[str, Any]],
@@ -3723,7 +3734,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     session_id=session_id or "", profile=request_profile or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=request_browser_control_transport_family,
-                    session_history_delivery=session_history_delivery)
+                    session_history_delivery=session_history_delivery,
+                    current_profile_only=self._current_profile_only)
                 agent = None
                 try:
                     agent = self._create_agent(
