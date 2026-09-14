@@ -528,7 +528,7 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
             "not be mounted",
             name, raw_api,
         )
-    return {
+    entry = {
         "name": name,
         "label": data.get("label", name),
         "description": data.get("description", ""),
@@ -543,6 +543,9 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
         "_dir": str(dashboard_dir),
         "_api_file": safe_api,
     }
+    if data.get("presentation") == "workspace":
+        entry["presentation"] = "workspace"
+    return entry
 
 
 def _discover_dashboard_plugins() -> list:
