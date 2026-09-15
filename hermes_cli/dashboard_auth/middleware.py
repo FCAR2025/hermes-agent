@@ -10,6 +10,7 @@ redirected to ``/login``; ``/api/*`` routes get a 401 JSON envelope.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Awaitable, Callable
 from urllib.parse import quote
 
@@ -42,13 +43,124 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/auth/providers", "/api/mcp/oauth/callback/",
     "/assets/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/")
 
+_PLUGIN_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
-def _path_is_public(path: str) -> bool:
+
+def _provider_public_auth_path(path: str) -> bool:
+    """True only for an exact, well-formed path declared by its owning provider."""
+    for provider in list_session_providers():
+        name = getattr(provider, "name", "")
+        declared = getattr(provider, "public_auth_paths", ())
+        if not _PLUGIN_ID_RE.fullmatch(name) or type(declared) is not tuple:
+            continue
+        prefix = f"/api/plugins/{name}/auth/"
+        if any(
+            not isinstance(item, str)
+            or not item.startswith(prefix)
+            or item == prefix
+            or any(marker in item for marker in ("%", "\\", "//", "*"))
+            or ".." in item.split("/")
+            for item in declared
+        ):
+            continue
+        if path in declared:
+            return True
+    return False
+
+
+def _path_is_public(request: Request) -> bool:
     """:data:`PUBLIC_API_PATHS` (shared with the legacy middleware) matched exactly so
     ``/api/status`` never exposes ``/api/status/extension``; :data:`_GATE_PUBLIC_PREFIXES`
     prefix-matched."""
-    return path in PUBLIC_API_PATHS or any(
+    path = request.url.path
+    raw_path = _raw_request_path(request)
+    shared_public = path in PUBLIC_API_PATHS and path != "/api/dashboard/plugins"
+    declared_public = raw_path == path and _provider_public_auth_path(path)
+    return shared_public or declared_public or any(
         path == p or path.startswith(p) for p in _GATE_PUBLIC_PREFIXES)
+
+
+def _resolve_surface_plugin(request: Request, plugin_id: str):
+    resolver = getattr(request.app.state, "dashboard_plugin_resolver", None)
+    if resolver is not None:
+        return resolver(plugin_id)
+    from hermes_cli.web_server import _get_dashboard_plugins
+
+    return next(
+        (plugin for plugin in _get_dashboard_plugins() if plugin.get("name") == plugin_id),
+        None,
+    )
+
+
+def _plugin_surface(request: Request, surface: str):
+    if not surface.startswith("plugin:"):
+        return None
+    plugin_id = surface.removeprefix("plugin:")
+    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        return None
+    try:
+        plugin = _resolve_surface_plugin(request, plugin_id)
+    except Exception:
+        return None
+    tab_path = (plugin or {}).get("tab", {}).get("path")
+    if (
+        not isinstance(tab_path, str)
+        or tab_path != f"/{plugin_id}"
+        or any(marker in tab_path for marker in ("%", "\\", "//"))
+    ):
+        return None
+    return plugin_id, tab_path
+
+
+def _raw_request_path(request: Request) -> str:
+    raw = request.scope.get("raw_path", b"")
+    return raw.decode("ascii", "surrogateescape") if isinstance(raw, bytes) else str(raw)
+
+
+def _surface_allows_request(request: Request, surface: str) -> tuple[bool, str]:
+    if surface == "dashboard":
+        return True, ""
+    plugin = _plugin_surface(request, surface)
+    if plugin is None:
+        return False, "invalid_session_surface"
+    plugin_id, tab_path = plugin
+    path = request.url.path
+    raw_path = _raw_request_path(request)
+    if (
+        not raw_path
+        or "%" in raw_path
+        or "\\" in raw_path
+        or "//" in raw_path
+        or ".." in path.split("/")
+    ):
+        return False, "restricted_surface"
+    allowed_exact = {
+        "/",
+        tab_path,
+        f"{tab_path}/",
+        "/api/auth/me",
+        "/api/dashboard/plugins",
+        f"/api/plugins/{plugin_id}",
+        "/favicon.ico",
+    }
+    allowed_prefixes = (
+        f"/api/plugins/{plugin_id}/",
+        f"/dashboard-plugins/{plugin_id}/",
+        "/assets/",
+    )
+    return (path in allowed_exact or path.startswith(allowed_prefixes)), "restricted_surface"
+
+
+def _surface_denied(reason: str) -> Response:
+    return JSONResponse({"error": reason, "detail": "Forbidden"}, status_code=403)
+
+
+async def _serve_session(request: Request, call_next, session) -> Response:
+    allowed, reason = _surface_allows_request(request, getattr(session, "surface", ""))
+    if not allowed:
+        return _surface_denied(reason)
+    request.state.session = session
+    return await call_next(request)
 
 
 def _safe_next_target(request: Request) -> str:
@@ -126,6 +238,10 @@ async def _serve_refreshed(request: Request, call_next, new_session, provider: s
     """Serve the request under a just-rotated session and write the rotated cookies back. Writing
     the ROTATED RT is mandatory: Portal runs reuse detection, so replaying the stale RT would
     revoke the session."""
+    allowed, reason = _surface_allows_request(
+        request, getattr(new_session, "surface", ""))
+    if not allowed:
+        return _surface_denied(reason)
     request.state.session = new_session
     response = await call_next(request)
     set_session_cookies(
@@ -154,7 +270,7 @@ async def gated_auth_middleware(
         return await call_next(request)
     # Already authenticated by the token-auth seam (service caller on a registered token
     # route): not a cookie session, must not bounce to /login.
-    if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
+    if getattr(request.state, "token_authenticated", False) or _path_is_public(request):
         return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
@@ -167,8 +283,7 @@ async def gated_auth_middleware(
         except ProviderError as e:
             return unreachable_response(str(e))
         if bearer_session is not None:
-            request.state.session = bearer_session
-            return await call_next(request)
+            return await _serve_session(request, call_next, bearer_session)
         return _unauth_response(request, reason="invalid_or_expired_session")
 
     at, _rt = read_session_cookies(request)
@@ -198,6 +313,9 @@ async def gated_auth_middleware(
             return _session_expired_response(request)
         return await _serve_refreshed(request, call_next, *refreshed)
 
+    allowed, reason = _surface_allows_request(request, getattr(session, "surface", ""))
+    if not allowed:
+        return _surface_denied(reason)
     request.state.session = session
     response = await call_next(request)
     if not provider_hint and session.provider:
