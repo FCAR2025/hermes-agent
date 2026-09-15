@@ -18,6 +18,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    surface: str = "dashboard"
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class DashboardAuthProvider(ABC):
     supports_password: bool = False
     supports_token: bool = False
     supports_session: bool = True
+    public_auth_paths: tuple[str, ...] = ()
 
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...

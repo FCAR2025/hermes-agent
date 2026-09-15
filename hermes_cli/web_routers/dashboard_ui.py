@@ -124,7 +124,7 @@ def _plugin_activated(plugin: dict, enabled_set: set, disabled_set: set) -> bool
 
 
 @router.get("/api/dashboard/plugins")
-async def get_dashboard_plugins():
+async def get_dashboard_plugins(request: Request):
     """Return discovered dashboard plugins (excludes user-hidden and non-enabled ones)."""
     def _run():
         plugins = _get_dashboard_plugins()
@@ -134,11 +134,17 @@ async def get_dashboard_plugins():
     plugins, hidden, enabled_set, disabled_set = await asyncio.to_thread(_run)
 
     # Strip internal fields before sending to frontend.
-    return [
+    visible = [
         {k: v for k, v in p.items() if not k.startswith("_")}
         for p in plugins
         if p.get("name", "") not in hidden and _plugin_activated(p, enabled_set, disabled_set)
     ]
+    session = getattr(request.state, "session", None)
+    surface = getattr(session, "surface", "dashboard")
+    if surface.startswith("plugin:"):
+        plugin_id = surface.removeprefix("plugin:")
+        return [plugin for plugin in visible if plugin.get("name") == plugin_id]
+    return visible
 
 
 @router.get("/api/dashboard/plugins/rescan")
