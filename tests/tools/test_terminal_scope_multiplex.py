@@ -76,6 +76,25 @@ def test_scoped_read_never_falls_through_to_process_env():
         reset_terminal_scope(token)
 
 
+def test_docker_isolation_booleans_use_terminal_scope_not_ambient_env(monkeypatch):
+    import tools.terminal_tool as tt
+
+    monkeypatch.setenv("TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "true")
+    token = set_terminal_scope({
+        "TERMINAL_ENV": "docker",
+        "TERMINAL_DOCKER_AUTO_MOUNT_PROFILE_FILES": "false",
+        "TERMINAL_DOCKER_NETWORK": "false",
+    })
+    try:
+        config = tt._get_env_config()
+    finally:
+        reset_terminal_scope(token)
+
+    assert config["docker_auto_mount_profile_files"] is False
+    assert config["docker_network"] is False
+
+
 @pytest.mark.parametrize(
     "config_yaml,dotenv",
     [
