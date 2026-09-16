@@ -31,7 +31,7 @@ def test_execute_code_forwards_fcar_isolation_flags():
         patch("tools.terminal_tool._creation_locks", {}),
         patch("tools.terminal_tool._creation_locks_lock", threading.Lock()),
         patch("tools.terminal_tool._env_lock", threading.Lock()),
-        patch("tools.terminal_tool._create_environment", side_effect=create_environment),
+        patch("tools.terminal_tool_backends._create_environment", side_effect=create_environment),
         patch("tools.terminal_tool._start_cleanup_thread"),
     ):
         environment, env_type = code_execution_tool._get_or_create_env("fcar-api-task")

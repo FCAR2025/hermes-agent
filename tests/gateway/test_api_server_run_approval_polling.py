@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
@@ -10,6 +11,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from tools import approval as approval_mod
+from tools.approval_gateway_wait import _ApprovalEntry
 
 
 def _make_app(adapter: APIServerAdapter) -> web.Application:
@@ -22,7 +24,7 @@ def _make_app(adapter: APIServerAdapter) -> web.Application:
 
 
 def _entry(request_id: str, command: str, description: str, **extra):
-    return approval_mod._ApprovalEntry(
+    return _ApprovalEntry(
         {
             "request_id": request_id,
             "command": command,
@@ -55,6 +57,9 @@ def adapter() -> APIServerAdapter:
 
 
 def _register_run(adapter: APIServerAdapter, run_id: str) -> None:
+    request = MagicMock()
+    request.headers = {}
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
     adapter._set_run_status(run_id, "running", session_id=f"session-{run_id}")
     adapter._run_approval_sessions[run_id] = run_id
 

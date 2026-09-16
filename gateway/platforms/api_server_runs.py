@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -715,9 +716,30 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = _load_owned_run(
+    run_id, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
-    return err or web.json_response(status)
+    if err is not None:
+        return err
+    approval_session_key = self._run_approval_sessions.get(run_id)
+    from tools.approval import get_pending_gateway_approval
+    pending = get_pending_gateway_approval(approval_session_key) if approval_session_key else None
+    response_status = dict(status)
+    if pending:
+        response_status["status"] = "waiting_for_approval"
+        response_status["pending_approval"] = {
+            "request_id": str(pending.get("request_id") or ""),
+            "command": _api_server._redact_api_error_text(pending.get("command") or "", limit=4096),
+            "description": _api_server._redact_api_error_text(
+                pending.get("description") or "", limit=1024),
+            "smart_denied": bool(pending.get("smart_denied")),
+            "choices": _api_server._approval_event_choices(
+                smart_denied=bool(pending.get("smart_denied")),
+                allow_session=pending.get("allow_session") is not False,
+                allow_permanent=pending.get("allow_permanent") is not False),
+        }
+    else:
+        response_status.pop("pending_approval", None)
+    return web.json_response(response_status)
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
@@ -789,6 +811,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
     room_scoped = bool(self._room_grant_token(request))
+    has_request_id = "request_id" in body
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
     # Room grants may resolve exactly one request and never widen to session/always.
@@ -796,8 +819,10 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
     approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
-        (raw_request_id is not None and (not request_id or len(request_id) > 256),
+        (has_request_id and re.fullmatch(r"[0-9a-f]{32}", request_id) is None,
          "Approval request_id is invalid.", "invalid_approval_request", 400),
+        (bool(request_id) and resolve_all,
+         "Approval request_id cannot be combined with resolve_all.", "invalid_approval_scope", 400),
         (choice not in allowed,
          "Invalid approval choice; expected one of: " + ", ".join(sorted(allowed)),
          "invalid_approval_choice", 400),
@@ -821,6 +846,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
     request_id_field = {"request_id": request_id} if request_id else {}
     _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
+    from tools.approval import get_pending_gateway_approval
+    pending = get_pending_gateway_approval(approval_session_key)
+    if pending:
+        self._set_run_status(
+            run_id, "waiting_for_approval", last_event="approval.request", approval=dict(pending))
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
         "resolved": resolved})
