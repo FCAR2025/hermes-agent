@@ -613,7 +613,7 @@ def _terminal_bool_config_value(terminal_config, config_key: str, env_name: str,
         if not isinstance(value, bool):
             raise TypeError(f"terminal.{config_key} must be a boolean")
         return value
-    raw = os.getenv(env_name)
+    raw = _tenv(env_name, None)
     if raw is None:
         return default
     normalized = raw.strip().lower()

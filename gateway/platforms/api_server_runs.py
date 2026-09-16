@@ -578,23 +578,33 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
+def _public_approval_payload(approval_data: Dict[str, Any], *, _api_server) -> Dict[str, Any]:
+    """Return the only approval fields that may cross or persist at the API boundary."""
+    approval = dict(approval_data or {})
+    from gateway.run import _redact_approval_command
+
+    smart_denied = bool(approval.get("smart_denied"))
+    return {
+        "request_id": str(approval.get("request_id") or ""),
+        "command": _api_server._redact_api_error_text(
+            _redact_approval_command(approval.get("command")), limit=4096),
+        "description": _api_server._redact_api_error_text(
+            approval.get("description") or "", limit=1024),
+        "smart_denied": smart_denied,
+        "choices": _api_server._approval_event_choices(
+            smart_denied=smart_denied,
+            allow_session=approval.get("allow_session") is not False,
+            allow_permanent=approval.get("allow_permanent") is not False),
+    }
+
+
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
-        event = dict(approval_data or {})
-        # Clients must never receive the raw flagged command: redact before it hits the stream.
-        # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
-        # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
-        # flagged. Reuse the gateway seam.
-        if "command" in event:
-            from gateway.run import _redact_approval_command
-            event["command"] = _redact_approval_command(event.get("command"))
-        event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
-            smart_denied=bool(event.get("smart_denied")),
-            allow_session=event.get("allow_session") is not False,
-            allow_permanent=event.get("allow_permanent") is not False)))
+        event = _public_approval_payload(approval_data, _api_server=_api_server)
+        event.update(_run_event(run_id, "approval.request"))
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
@@ -726,17 +736,8 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
     response_status = dict(status)
     if pending:
         response_status["status"] = "waiting_for_approval"
-        response_status["pending_approval"] = {
-            "request_id": str(pending.get("request_id") or ""),
-            "command": _api_server._redact_api_error_text(pending.get("command") or "", limit=4096),
-            "description": _api_server._redact_api_error_text(
-                pending.get("description") or "", limit=1024),
-            "smart_denied": bool(pending.get("smart_denied")),
-            "choices": _api_server._approval_event_choices(
-                smart_denied=bool(pending.get("smart_denied")),
-                allow_session=pending.get("allow_session") is not False,
-                allow_permanent=pending.get("allow_permanent") is not False),
-        }
+        response_status["pending_approval"] = _public_approval_payload(
+            pending, _api_server=_api_server)
     else:
         response_status.pop("pending_approval", None)
     return web.json_response(response_status)
@@ -850,7 +851,8 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     pending = get_pending_gateway_approval(approval_session_key)
     if pending:
         self._set_run_status(
-            run_id, "waiting_for_approval", last_event="approval.request", approval=dict(pending))
+            run_id, "waiting_for_approval", last_event="approval.request",
+            approval=_public_approval_payload(pending, _api_server=_api_server))
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
         "resolved": resolved})

@@ -102,6 +102,34 @@ async def test_optional_fcar_import_failure_does_not_consume_native_approve(tmp_
 
 
 @pytest.mark.asyncio
+async def test_optional_instar_import_failure_does_not_consume_native_approve(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    monkeypatch.setitem(sys.modules, "hermes_instar_decision_bridge", None)
+
+    consumed = await adapter._maybe_handle_instar_loop_decision(_event("/approve"))
+
+    assert consumed is False
+
+
+@pytest.mark.asyncio
+async def test_optional_instar_import_failure_does_not_consume_native_callback(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    query = SimpleNamespace(answer=AsyncMock())
+    monkeypatch.setitem(sys.modules, "hermes_instar_decision_bridge", None)
+
+    consumed = await adapter._maybe_handle_instar_loop_callback(
+        query,
+        "ea:once:native-approval",
+        {"chat_id": 12345, "thread_id": None},
+    )
+
+    assert consumed is False
+    query.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handle_command_consumes_fcar_gateway_before_llm_dispatch():
     adapter = object.__new__(TelegramAdapter)
     msg = SimpleNamespace(text="/fcar_gateway_status")

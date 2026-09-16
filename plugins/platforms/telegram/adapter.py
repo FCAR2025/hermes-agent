@@ -5913,6 +5913,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
     async def _maybe_handle_instar_loop_decision(self, event: MessageEvent) -> bool:
+        text = str(getattr(event, "text", None) or "")
+        if re.search(r"\bloop\s+(?:pr|gate)\s+", text, re.IGNORECASE) is None:
+            return False
         try:
             scripts_dir = _Path("/home/info/scripts")
             if str(scripts_dir) not in sys.path:
@@ -5936,6 +5939,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
     async def _maybe_handle_instar_loop_callback(self, query, data: str, cb: Dict[str, Any]) -> bool:
+        if not isinstance(data, str) or not data.startswith(("gate:", "money:", "sms:")):
+            return False
         try:
             scripts_dir = _Path("/home/info/scripts")
             if str(scripts_dir) not in sys.path:
