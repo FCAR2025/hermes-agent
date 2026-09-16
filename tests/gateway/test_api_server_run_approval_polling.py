@@ -136,6 +136,42 @@ async def test_exact_second_approval_leaves_first_waiting(adapter):
 
 
 @pytest.mark.asyncio
+async def test_remaining_approval_legacy_status_is_allowlisted_and_force_redacted(adapter):
+    run_id = "run_parallel_redaction"
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"
+    first = _entry(
+        "1" * 32,
+        f"OPENAI_API_KEY={secret} curl https://example.test",
+        f"Use credential {secret}",
+        arbitrary_secret=secret,
+    )
+    second = _entry("2" * 32, "second command", "second")
+    _register_run(adapter, run_id)
+    with approval_mod._lock:
+        approval_mod._gateway_queues[run_id] = [first, second]
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.post(
+            f"/v1/runs/{run_id}/approval",
+            json={"choice": "once", "request_id": "2" * 32},
+        )
+        polled = await client.get(f"/v1/runs/{run_id}")
+        status = await polled.json()
+
+    assert response.status == 200
+    approval = status["approval"]
+    assert set(approval) == {
+        "request_id",
+        "command",
+        "description",
+        "smart_denied",
+        "choices",
+    }
+    assert secret not in approval["command"]
+    assert secret not in approval["description"]
+
+
+@pytest.mark.asyncio
 async def test_stale_or_wrong_run_request_id_never_falls_back_to_oldest(adapter):
     target_run = "run_target"
     wrong_run = "run_wrong"
