@@ -64,7 +64,7 @@ permissions:
 jobs:
   validate:
     name: Require a supported native smoke target
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
       TARGET: ${{ inputs.platform }}/${{ inputs.arch }}/${{ inputs.format }}
@@ -81,7 +81,7 @@ jobs:
     name: macOS install and chat
     needs: validate
     if: inputs.platform == 'darwin'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-6vcpu-macos-15' || 'macos-latest' }}
     timeout-minutes: 30
     # Also constrains the recording action's nested cache to read-only.
     cache-mode: read

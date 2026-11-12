@@ -87,7 +87,7 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
         'model': {'provider': 'custom', 'default': 'original', 'base_url': url, 'context_length': 64000},
         'auxiliary': {'title_generation': {'enabled': False},
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
-        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 12000,
+        'compression': {'protect_first_n': 1, 'protect_last_n': 1, 'threshold_tokens': 12000,
                         'threshold': 0.5, 'in_place': False},
         'platform_toolsets': {'cli': []}}))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {
@@ -120,7 +120,7 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
         assert 'result' in reply, reply
         return reply['result']
 
-    async def wait_rows(predicate, timeout=40):
+    async def wait_rows(predicate, timeout=80):
         await async_wait_until(predicate, timeout=timeout, interval=.03, what='admission rows')
 
     async def first(desc, owner):

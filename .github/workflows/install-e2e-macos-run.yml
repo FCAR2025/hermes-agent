@@ -101,7 +101,7 @@ jobs:
       update-ref: ${{ inputs.update-ref }}
       tag-has-desktop: ${{ inputs.tag-has-desktop }}
       leg-id: ${{ inputs.leg-id }}
-      runner: blacksmith-6vcpu-macos-latest
+      runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-6vcpu-macos-latest' || 'macos-latest' }}
       timeout-minutes: ${{ inputs.timeout-minutes }}
 
   # ---- arm 2: the published dmg, then Playwright drives the app ------------
@@ -112,7 +112,7 @@ jobs:
     if: >-
       inputs.install-method == 'desktop-installer@latest' && inputs.tag-has-desktop
       && contains(fromJSON('["open-app-update", "hermes-desktop-app-update", "hermes-update", "installer-script", "installer-script+desktop"]'), inputs.update-method)
-    runs-on: blacksmith-12vcpu-macos-latest
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-12vcpu-macos-latest' || 'macos-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
