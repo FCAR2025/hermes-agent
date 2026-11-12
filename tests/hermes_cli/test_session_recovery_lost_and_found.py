@@ -224,6 +224,7 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
 
     import hermes_cli.session_lost_and_found as laf
 
+    laf._last_cli_refusal = {"reason": "wal_reset_vulnerable", "detail": "stale"}
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
@@ -235,6 +236,30 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     message = str(excinfo.value)
     assert "sessions" in message and "messages" in message
     assert "sqlite3" in message
+    assert ".recover" in message
+    assert not output.exists()
+
+
+def test_stale_cli_refusal_cleared_before_salvage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale refusal from an earlier CLI probe must not leak into a missing-CLI error."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "schemaless-recovered.db"
+    _make_schema_unreadable_source(source)
+
+    import hermes_cli.session_lost_and_found as laf
+
+    laf._last_cli_refusal = {"reason": "wal_reset_vulnerable", "detail": "stale"}
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    with pytest.raises(SessionRecoverySourceError) as excinfo:
+        recover_session_database(
+            source,
+            output,
+            work_dir=tmp_path,
+            allow_partial=True,
+        )
+    message = str(excinfo.value)
     assert ".recover" in message
     assert not output.exists()
 

@@ -77,7 +77,7 @@ jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 30 }}
+    timeout-minutes: ${{ matrix.timeout || (github.repository == 'NousResearch/hermes-agent' && 30 || 60) }}
     strategy:
       fail-fast: false
       matrix:
@@ -96,12 +96,12 @@ jobs:
             runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-windows-2025' || 'windows-latest' }}
             marker: windows
           - name: Windows-only tests (arm64, 1/2)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
             marker: windows
             timeout: 60
             slice: 1/2
           - name: Windows-only tests (arm64, 2/2)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
             marker: windows
             timeout: 60
             slice: 2/2
@@ -209,7 +209,8 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ github.repository != 'NousResearch/hermes-agent' && '2' || (matrix.marker == 'windows' && '16' || '') }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository == 'NousResearch/hermes-agent' && '300' || '600' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

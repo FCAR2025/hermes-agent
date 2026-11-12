@@ -1065,9 +1065,10 @@ def _recover_via_lost_and_found(
     (shell-only, not in Python's ``sqlite3``) rebuilds rows into a scratch lost_and_found database which
     is then heuristically mapped into a fresh current-schema database."""
     from hermes_cli.session_lost_and_found import (
-        SQLITE3_CLI_GUIDANCE, LostAndFoundError, find_sqlite3_cli, find_sqlite3_cli_refusal, map_lost_and_found_rows,
+        SQLITE3_CLI_GUIDANCE, LostAndFoundError, clear_sqlite3_cli_refusal, find_sqlite3_cli, find_sqlite3_cli_refusal, map_lost_and_found_rows,
         rebuild_fts_indexes, run_cli_lost_and_found_recover, stub_missing_parent_sessions,
     )
+    clear_sqlite3_cli_refusal()
     missing = ", ".join(missing_required)
     sqlite3_bin = find_sqlite3_cli()
     if sqlite3_bin is None:
@@ -1201,6 +1202,8 @@ def recover_session_database(
     progress_cb: Optional[ProgressCallback] = None, allow_partial: bool = False,
 ) -> dict[str, Any]:
     """Separate-output salvage is allowed; a canonical output requires offline ownership."""
+    from hermes_cli.session_lost_and_found import clear_sqlite3_cli_refusal
+    clear_sqlite3_cli_refusal()
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
     from contextlib import nullcontext
     # Validate before creating any lock or output. Reserve only a canonical
