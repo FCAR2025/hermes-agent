@@ -7,6 +7,8 @@ and every root-to-area chain at 30k, so it loads whole on 128k+ models: long for
 
 **Never give up on the right solution.**
 
+@ARCHITECTURE.md @TESTING.md @SECURITY.md
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a messaging
