@@ -127,3 +127,30 @@ class TestGitTrampolineSelfHeal:
         assert candidates[1] == (
             profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
         )
+
+    def test_probe_fork_bomb_invokes_run_git_with_project_root_cwd(self, tmp_path, monkeypatch):
+        from hermes_cli import main as cli_main, update_custody
+        from hermes_cli.update_cmd_git import _probe_fork_bomb
+
+        monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+
+        recorded_calls = []
+
+        def fake_run_git(git_cmd, args, **kwargs):
+            recorded_calls.append((git_cmd, args, kwargs))
+            raise FileNotFoundError("fixture: git missing")
+
+        monkeypatch.setattr(update_custody, "run_git", fake_run_git)
+
+        def fail_subprocess_run(*args, **kwargs):
+            pytest.fail("raw subprocess.run must not be called when run_git raises FileNotFoundError")
+
+        monkeypatch.setattr("subprocess.run", fail_subprocess_run)
+
+        result = _probe_fork_bomb(["git"])
+        assert result is None
+        assert len(recorded_calls) == 1
+        assert recorded_calls[0][0] == ["git"]
+        assert recorded_calls[0][1] == ["--version"]
+        assert recorded_calls[0][2].get("cwd") == tmp_path
+

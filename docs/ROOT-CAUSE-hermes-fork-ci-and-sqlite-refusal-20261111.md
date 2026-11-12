@@ -13,6 +13,10 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
    - On 3-vCPU macOS fork runners (`macos-latest`), gateway bootstrap reserve wait (`_browse_reconcile_reserve_wait_s`) provided only a 2.0s buffer over `BROWSE_RECONCILE_BUDGET_S` (5.0s total), which is too tight when a slow browse reconcile in a child process is rolling back and releasing `gateway.lock` under load, triggering a false `OwnershipConflict`.
 5. **Subprocess Encoding and Exception Ratchet Violations in Git Helpers**: Subprocess invocation in `_probe_fork_bomb` lacked explicit `encoding="utf-8"`, `errors="replace"`, and `check=False`, violating Windows footgun rules and Ruff `PLW1510`. Broad `except Exception: pass` blocks in `_probe_fork_bomb` and `_locate_real_git` violated code health ratchet rules `BLE001` and `S110`.
 6. **Hardcoded Upstream Default Branch in Contributor Attribution Check**: `.github/workflows/contributor-check.yml` hardcoded `origin/main` for `git merge-base`, scanning upstream history rather than the fork PR's target branch (`github.base_ref`).
+7. **Additive Schema Budget Protection Bypass during Durability Barrier Application**: In `_apply_additive_schema`, `_reapply_durability_barriers(conn)` was executed prior to arming the SQLite progress handler (`budget.arm(conn)`) and outside the transaction rollback error handler. On macOS, durability PRAGMAs (`checkpoint_fullfsync`, `synchronous=FULL`) executed on slow connections exceed the browse reconcile budget and suppress errors. Subsequent `conn.execute('BEGIN IMMEDIATE')` invoked the armed progress handler outside the `try:` block, causing `sqlite3.OperationalError: interrupted` to escape unhandled and trigger the generic corrupt-store 503 instead of the expected budget-exhaustion retryable 503.
+8. **Subprocess Spawn Authority & Working Directory Drift in Git Fork Bomb Probe**: `_probe_fork_bomb` invoked `run_git` without explicitly passing `cwd`, causing the working directory to default to the process repository root rather than `update_cmd.PROJECT_ROOT`. This violated update boundary custody assertions in `test_update_target_identity.py`. Additionally, a redundant raw `subprocess.run` fallback bypassed the centralized `run_git` authority.
+9. **JS/TS Checks Workflow Timeout Bounding on Fork Runners**: Hardcoded `timeout-minutes: 30` in `js-tests.yml` sized for 32-vCPU Blacksmith runners. On 2-vCPU `ubuntu-latest` fork runners at `--concurrency 2` with uncached `npm ci` and Electron setup, the job hit the 30-minute ceiling and was cancelled despite 0 errors.
+10. **Managed Runtime Resolution Allowlist Omission**: `shutil.which("git")` introduced in `_locate_real_git` (`hermes_cli/update_cmd_git.py`) was not registered in `tests/fixtures/resolution_allowlist.json`, triggering AST enforcement failure in `test_bare_which_and_known_path_tables_are_allowlisted`.
 
 ## Mechanism
 
@@ -33,7 +37,13 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 - In `tests/hermes_cli/test_git_trampoline_windows_live.py`, `test_locate_real_git_finds_runner_git_core` failed with `AssertionError: expected git-core git.exe on windows-latest` because `_locate_real_git()` returned `None`.
 
 ### Failure B3: Contention & timing failures on fork runners
-- **Linux Python tests (1/3)**: `.github/workflows/tests.yml` set `HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 4 }}`. On a standard 2-vCPU `ubuntu-latest` runner, 4 parallel test worker processes running multi-process daemons caused severe CPU starvation. In `tests/gateway/test_journey_compress_restart_fifo.py`, `wait_rows` timed out or turn progression lagged, and with `protect_last_n: 2`, `PRESSURE_1` remained uncompacted in `wire` when compression occurred early under load.
+- **Linux Python tests (1/3)**:
+  - `.github/workflows/tests.yml` set `HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 4 }}`. On a standard 2-vCPU `ubuntu-latest` runner, 4 parallel test worker processes running multi-process daemons caused severe CPU starvation.
+  - In `tests/gateway/test_journey_compress_restart_fifo.py`:
+    - `ContextCompressor._find_tail_cut_by_tokens` clamps `min_tail_floor = max(3, min(self.protect_last_n, _MAX_TAIL_MESSAGE_FLOOR))` and cuts the history tail using `lean_tail_budget(64000, threshold_tokens)`.
+    - Because `CompactingModel` omits `usage` on SSE streaming responses (`body.get('stream')`), `_provider_omits_usage` becomes `True` after `PRESSURE_0`, causing `_preflight_compression` to fire as soon as rough token estimates hit `threshold_tokens`.
+    - In CI where system prompt lengths exceed 3.2KB, `PRESSURE_3` crossed the 12,000 token preflight threshold one turn early. With `threshold_tokens=12000`, `lean_tail_budget(64000, 12000) == 6000` (`soft_ceiling == 9000`), and `[P1, A1, P2, A2, P3]` fit inside `soft_ceiling` (`7,610 <= 9000`), so `cut=3` retained `PRESSURE_1` in the tail (`AssertionError: FOLLOWER_1`).
+    - Setting `threshold_tokens: 24000` (where `lean_tail_budget == 10000`, `soft_ceiling == 15000`) and expanding the model limit guard from `50000` to `95000` bytes ensures `PRESSURE_1` always lands cleanly in the compacted middle across all system prompt sizes (0.5KB–21KB).
 - **macOS OS-specific tests (1/2)**: `tests/hermes_cli/test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]` failed with `OwnershipConflict: Gateway runtime already owns profile .../profiles/scribe`. In `gateway/run_bootstrap.py`, `_browse_reconcile_reserve_wait_s` was `BROWSE_RECONCILE_BUDGET_S + 2.0` (5.0s total). Under contention on a 3-vCPU `macos-latest` runner, the slow browse subprocess required slightly more than 5.0s to detect timeout, abort, and clean up the flock, causing bootstrap reserve to raise `OwnershipConflict` before the lock was released.
 
 ### Failure B4: Windows footgun, Ruff PLW1510, and code health ratchet failures in `update_cmd_git.py` (run 43137784970)
@@ -43,6 +53,30 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 ### Failure B5: Contributor check scanning upstream commits on fork PR (run 43137784970)
 - In `.github/workflows/contributor-check.yml`, `MERGE_BASE=$(git merge-base origin/main HEAD)` assumed the PR targets `origin/main`. PR #4 targets `update/joy-hermes-20261103`.
 - `git merge-base origin/main HEAD` returned an upstream commit from months ago, causing `git log ${MERGE_BASE}..HEAD` to evaluate 30+ upstream commits whose authors were not in `AUTHOR_MAP` or `contributors/emails/`, causing the attribution check to fail.
+
+### Failure B6: macOS browse schema drift timeout escapes unhandled during durability barrier execution (job 130923027575)
+- In `tests/hermes_cli/test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]`, browse schema reconciliation runs against a `SlowConnection`.
+- At `hermes_state_reconcile.py:455`, `budget = _Budget(BROWSE_RECONCILE_BUDGET_S)` starts a 3.0s deadline.
+- Inside `_apply_additive_schema(path, budget)` (lines 233–238):
+  - On macOS (`sys.platform == "darwin"`), `_reapply_durability_barriers(conn)` executes `PRAGMA checkpoint_fullfsync=1` and `PRAGMA synchronous=FULL` on `SlowConnection` before `budget.arm(conn)` is called, consuming the remaining 3.0s budget while suppressing internal exceptions.
+  - Next, `budget.arm(conn)` arms the progress handler.
+  - `conn.execute('BEGIN IMMEDIATE')` executes at line 237 OUTSIDE the `try:` block at line 238.
+  - When the progress handler fires on `BEGIN IMMEDIATE`, SQLite raises `sqlite3.OperationalError: interrupted` outside `try:`, bypassing the rollback and budget translation handler at line 254 (`if budget.expired and isinstance(exc, sqlite3.OperationalError): raise BrowseBudgetExceeded(...)`).
+  - Unhandled `OperationalError` escapes `reconcile_drift_for_browse` and hits `hermes_cli/web_server_sessions.py:405-419`, returning a 503 with `"Session store schema is unavailable or corrupt..."` instead of the expected declarative drift timeout error containing `"nothing was changed"` and `"sessions repair"`.
+
+### Failure B7: Windows update target identity guard assertion failure from missing probe cwd (job 130923027692)
+- In `tests/hermes_cli/test_update_target_identity.py::test_stable_zip_consumes_the_same_commit_through_the_real_swap[gitless|no-git|git-error|dirty]`, the test installs a custody guard asserting that all Git invocations have `cwd in {t.clone, t.origin}`.
+- In `hermes_cli/update_cmd_git.py`, `_probe_fork_bomb(argv)` called `run_git(argv, ["--version"], timeout=15, **_GIT_TEXT_KW)` without `cwd`.
+- Without `cwd`, `update_custody.run` defaulted `cwd` to `os.getcwd()` (`D:/a/hermes-agent/hermes-agent`), which is the repository root outside `{t.clone, t.origin}`, failing the custody guard assertion.
+- Additionally, `_probe_fork_bomb` contained a redundant raw `subprocess.run` fallback that bypassed `update_custody.run_git`, violating single spawn authority.
+
+### Failure B8: JS & TS checks job timeout cancellation on fork runners (job 130923026025)
+- In `.github/workflows/js-tests.yml:24`, `timeout-minutes: 30` was hardcoded, assuming high-concurrency execution on `blacksmith-32vcpu-ubuntu-2404` at `--concurrency 11`.
+- On 2-vCPU fork runners (`ubuntu-latest`), concurrency drops to 2 and initial environment initialization (clean `npm ci`, Electron runtime setup) consumes more wall-clock time, causing the job to hit the 30m deadline and cancel after 30 minutes with 0 errors.
+
+### Failure B9: Managed runtime resolution allowlist omission for `_locate_real_git` (job 130923027667)
+- `tests/test_managed_runtime_resolution.py::test_bare_which_and_known_path_tables_are_allowlisted` enforces that all `shutil.which` call sites are cataloged.
+- In `hermes_cli/update_cmd_git.py`, `shutil.which("git")` was added in `_locate_real_git` to discover the active toolchain root without an entry in `tests/fixtures/resolution_allowlist.json`.
 
 ## Structural fix
 
@@ -67,7 +101,7 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 4. **Fork Runner Concurrency and Timing Headroom**:
    - In `.github/workflows/tests.yml`, set `HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 2 }}` to match the 2-vCPU capacity of `ubuntu-latest`.
    - In `tests/gateway/test_journey_compress_restart_fifo.py`:
-     - Configure `protect_last_n: 1` in test `config.yaml` so `PRESSURE_1` is guaranteed to be in the compacted middle regardless of which pressure turn triggers compression.
+     - Configure `threshold_tokens: 24000` with `protect_last_n: 2` in test `config.yaml` and expand the context limit guard to `len(wire) > 95000` so `PRESSURE_1` lands cleanly in the compacted middle regardless of system prompt size.
      - Increase `wait_rows` timeout from 40s to 80s to accommodate 2-vCPU load spikes.
    - In `gateway/run_bootstrap.py`:
      - Set `_browse_reconcile_reserve_wait_s` to `BROWSE_RECONCILE_BUDGET_S + 7.0` (10.0s total wait) so gateway bootstrap easily outlasts slow browse reconcile teardown on 3-vCPU macOS runners.
@@ -81,6 +115,22 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 
 6. **Dynamic PR Base Ref in Contributor Check**:
    - In `.github/workflows/contributor-check.yml`, compute `BASE_REF="${{ github.base_ref || 'main' }}"` and resolve `MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD 2>/dev/null || git merge-base "${BASE_REF}" HEAD 2>/dev/null || git merge-base origin/main HEAD)`.
+
+7. **Comprehensive Try-Block and Pre-Barrier Arming in Schema Reconcile**:
+   - In `hermes_state_reconcile.py` (`_apply_additive_schema`), enclose all post-connection operations (`budget.arm(conn)`, `_reapply_durability_barriers(conn)`, `budget.check()`, `conn.execute('BEGIN IMMEDIATE')`, `apply_declared_schema`, schema read probes, and `COMMIT`) inside a single comprehensive `try / except BaseException as exc:` block.
+   - Arm the progress handler via `budget.arm(conn)` before running `_reapply_durability_barriers(conn)`.
+   - Call `budget.check()` immediately after `_reapply_durability_barriers(conn)` so any budget expiration tripped during barrier pragmas translates directly into `BrowseBudgetExceeded` before attempting transaction start.
+   - In the exception handler, safely rollback and if `(budget.expired or budget.remaining() <= 0) and isinstance(exc, sqlite3.DatabaseError): raise BrowseBudgetExceeded(...) from exc`.
+
+8. **Enforce Single Spawn Authority and Explicit Project Root in Fork Bomb Probe**:
+   - In `hermes_cli/update_cmd_git.py`, update `_probe_fork_bomb(argv: list, cwd=None) -> Optional[bool]` to resolve `cwd` from `update_cmd._m().PROJECT_ROOT` if not explicitly provided, ensuring the probe runs within the verified project root.
+   - Remove the redundant second `subprocess.run` fallback block entirely so `update_custody.run_git` remains the sole spawn authority.
+
+9. **Dynamic Timeout for JS & TS Workflow**:
+   - In `.github/workflows/js-tests.yml`, configure `timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 90 }}` matching the adaptive pattern used in `tests.yml` and `tests-os.yml`.
+
+10. **Register Executable Resolution in Allowlist**:
+   - In `tests/fixtures/resolution_allowlist.json`, add an entry for `hermes_cli/update_cmd_git.py::_locate_real_git` (`bare_which`) with justification explaining Windows toolchain root discovery via PATH.
 
 ## Proof
 
@@ -107,3 +157,17 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 6. **Failure B5 Proof**:
    - `.github/workflows/contributor-check.yml` parses cleanly via `yaml.safe_load`.
    - Local contributor attribution check loop against `fcar/update/joy-hermes-20261103..HEAD` passes with exit code 0.
+
+7. **Failure B6 Proof**:
+   - Dedicated unit test in `tests/hermes_cli/test_browse_schema_drift.py` verifying that when durability barrier application exceeds the budget on a slow connection, `_open_session_db_at_path` raises 503 with `"nothing was changed"` and `"sessions repair"` without corrupt store messages.
+   - All tests in `tests/hermes_cli/test_browse_schema_drift.py` pass cleanly.
+
+8. **Failure B7 Proof**:
+   - Dedicated unit test in `tests/hermes_cli/test_cmd_update.py` verifying `_probe_fork_bomb` invokes `run_git` with `cwd` equal to `update_cmd.PROJECT_ROOT` and returns `None` without raw `subprocess.run` on `FileNotFoundError`.
+   - All tests in `tests/hermes_cli/test_update_target_identity.py` and `tests/hermes_cli/test_cmd_update.py` pass cleanly.
+
+9. **Failure B8 Proof**:
+   - `.github/workflows/js-tests.yml` validated via `yaml.safe_load` with dynamic 90-minute timeout on fork runners.
+
+10. **Failure B9 Proof**:
+   - `pytest tests/test_managed_runtime_resolution.py` passes 8/8 tests cleanly with exit code 0.

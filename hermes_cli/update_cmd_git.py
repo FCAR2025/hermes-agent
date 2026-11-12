@@ -574,30 +574,19 @@ def _print_fetch_failure(stderr: str, *, git_cmd=None, root: Optional[Path] = No
             print(f"  ... ({len(lines) - 15} more lines omitted)")
 
 
-def _probe_fork_bomb(argv: list) -> Optional[bool]:
+def _probe_fork_bomb(argv: list, cwd=None) -> Optional[bool]:
     """Run ``<argv> --version``; True/False = guard message seen/absent, None = probe itself failed."""
     try:
+        from hermes_cli.update_cmd import _m
         from hermes_cli.update_custody import run_git
 
-        result = run_git(argv, ["--version"], timeout=15, **_GIT_TEXT_KW)
-        return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
+        root = cwd if cwd is not None else _m().PROJECT_ROOT
+        probe_cwd = root if root is not None and Path(root).is_dir() else None
+        result = run_git(argv, ["--version"], cwd=probe_cwd, timeout=15, **_GIT_TEXT_KW)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("run_git fork bomb probe failed: %s", exc)
-    try:
-        res = subprocess.run(
-            list(argv) + ["--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=15,
-            creationflags=windows_hide_flags(),
-        )
-        return "fork bomb" in ((res.stdout or "") + (res.stderr or "")).lower()
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("subprocess.run fork bomb probe failed: %s", exc)
         return None
+    return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
 
 
 def _git_is_trampoline(git_cmd: list) -> bool:

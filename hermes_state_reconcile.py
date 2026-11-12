@@ -232,10 +232,11 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
                                  isolation_level=None)) as conn:
-        _reapply_durability_barriers(conn)
-        budget.arm(conn)
-        conn.execute('BEGIN IMMEDIATE')
         try:
+            budget.arm(conn)
+            _reapply_durability_barriers(conn)
+            budget.check()
+            conn.execute('BEGIN IMMEDIATE')
             cursor = conn.cursor()
             apply_declared_schema(cursor)
             # Postcondition, still inside the transaction: every declared table/column resolves.
@@ -251,7 +252,7 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
         except BaseException as exc:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute('ROLLBACK')
-            if budget.expired and isinstance(exc, sqlite3.OperationalError):
+            if (budget.expired or budget.remaining() <= 0) and isinstance(exc, sqlite3.DatabaseError):
                 raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
             raise
 
