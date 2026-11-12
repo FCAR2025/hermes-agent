@@ -14,7 +14,7 @@
 // their lines, and a failure is then hard to read.
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
-// `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--concurrency N` sets the limit. `--slice K/N` slices units. `--list` prints the units and exits.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
@@ -30,6 +30,7 @@ function discoverUnits() {
   })
   /** @type {{location: string, scripts?: Record<string,string>}[]} */
   const pkgs = JSON.parse(raw)
+  pkgs.sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0))
 
   /** @type {{pkg: string, script: string}[]} */
   const units = []
@@ -43,6 +44,39 @@ function discoverUnits() {
     }
   }
   return units
+}
+
+/** @param {string[]} argv @returns {{index: number, count: number} | null} */
+function parseSlice(argv) {
+  let raw = null
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--slice') {
+      if (i + 1 >= argv.length) {
+        console.error('::error::--slice requires a value in the form K/N (e.g. 1/4)')
+        process.exit(1)
+      }
+      raw = argv[i + 1]
+      break
+    } else if (arg.startsWith('--slice=')) {
+      raw = arg.slice('--slice='.length)
+      break
+    }
+  }
+  if (!raw) return null
+
+  const match = /^([1-9]\d*)\/([1-9]\d*)$/.exec(raw)
+  if (!match) {
+    console.error(`::error::Invalid --slice format: ${raw}. Expected K/N with positive integers (e.g. 1/4)`)
+    process.exit(1)
+  }
+  const index = Number(match[1])
+  const count = Number(match[2])
+  if (index > count) {
+    console.error(`::error::Invalid --slice bounds: ${raw}. Must satisfy 1 <= K <= N (received ${index} > ${count})`)
+    process.exit(1)
+  }
+  return { index, count }
 }
 
 /** @param {{pkg: string, script: string}} unit */
@@ -76,13 +110,28 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  const sliceSpec = parseSlice(argv)
+  const allUnits = discoverUnits()
 
-  if (units.length === 0) {
+  if (allUnits.length === 0) {
     console.error(
       '::error::No workspace package declares a check script — refusing to report green having run nothing.',
     )
     process.exit(1)
+  }
+
+  const units = sliceSpec
+    ? allUnits.filter((_, idx) => idx % sliceSpec.count === sliceSpec.index - 1)
+    : allUnits
+
+  if (units.length === 0) {
+    if (argv.includes('--list')) {
+      return
+    }
+    console.log(
+      `slice ${sliceSpec.index}/${sliceSpec.count}: 0 checks assigned (${allUnits.length} total discovered) — nothing to run`,
+    )
+    return
   }
 
   if (argv.includes('--list')) {
@@ -91,9 +140,20 @@ async function main() {
   }
 
   const flagIdx = argv.indexOf('--concurrency')
+  let parsedConcurrency = NaN
+  if (flagIdx !== -1 && argv[flagIdx + 1]) {
+    parsedConcurrency = Number(argv[flagIdx + 1])
+  } else {
+    for (const arg of argv) {
+      if (arg.startsWith('--concurrency=')) {
+        parsedConcurrency = Number(arg.slice('--concurrency='.length))
+        break
+      }
+    }
+  }
   const concurrency = Math.max(
     1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+    !isNaN(parsedConcurrency) ? parsedConcurrency : Math.min(units.length, availableParallelism()),
   )
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)

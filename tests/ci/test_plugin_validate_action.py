@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 import hermes_yaml as yaml
@@ -22,7 +23,8 @@ def test_external_validator_checkout_uses_requested_ref_and_preserves_caller(tmp
     runner.mkdir()
     output = tmp_path / "output"
     env_file = tmp_path / "env"
-    env = {**os.environ, "RUNNER_TEMP": str(runner), "RUNNER_OS": "Linux",
+    env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+           "RUNNER_TEMP": str(runner), "RUNNER_OS": "Linux",
            "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(env_file), "_HERMES_REF": ref,
            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{repo.as_uri()}.insteadOf",
            "GIT_CONFIG_VALUE_0": "https://github.com/NousResearch/hermes-agent.git"}
