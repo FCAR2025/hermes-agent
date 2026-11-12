@@ -11,6 +11,8 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
    - On 2-vCPU Linux fork runners (`ubuntu-latest`), running `HERMES_TEST_WORKERS: 4` causes CPU oversubscription and timing contention, leading to race conditions where long-running journey compaction tests fail under tight admission timeouts.
    - In `test_journey_compress_restart_fifo.py`, `protect_last_n: 2` with short pressure histories can leave turn 1 inside the protected tail instead of the compacted summary if compaction triggers early or admissions experience timing latency.
    - On 3-vCPU macOS fork runners (`macos-latest`), gateway bootstrap reserve wait (`_browse_reconcile_reserve_wait_s`) provided only a 2.0s buffer over `BROWSE_RECONCILE_BUDGET_S` (5.0s total), which is too tight when a slow browse reconcile in a child process is rolling back and releasing `gateway.lock` under load, triggering a false `OwnershipConflict`.
+5. **Subprocess Encoding and Exception Ratchet Violations in Git Helpers**: Subprocess invocation in `_probe_fork_bomb` lacked explicit `encoding="utf-8"`, `errors="replace"`, and `check=False`, violating Windows footgun rules and Ruff `PLW1510`. Broad `except Exception: pass` blocks in `_probe_fork_bomb` and `_locate_real_git` violated code health ratchet rules `BLE001` and `S110`.
+6. **Hardcoded Upstream Default Branch in Contributor Attribution Check**: `.github/workflows/contributor-check.yml` hardcoded `origin/main` for `git merge-base`, scanning upstream history rather than the fork PR's target branch (`github.base_ref`).
 
 ## Mechanism
 
@@ -33,6 +35,14 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 ### Failure B3: Contention & timing failures on fork runners
 - **Linux Python tests (1/3)**: `.github/workflows/tests.yml` set `HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && 32 || 4 }}`. On a standard 2-vCPU `ubuntu-latest` runner, 4 parallel test worker processes running multi-process daemons caused severe CPU starvation. In `tests/gateway/test_journey_compress_restart_fifo.py`, `wait_rows` timed out or turn progression lagged, and with `protect_last_n: 2`, `PRESSURE_1` remained uncompacted in `wire` when compression occurred early under load.
 - **macOS OS-specific tests (1/2)**: `tests/hermes_cli/test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]` failed with `OwnershipConflict: Gateway runtime already owns profile .../profiles/scribe`. In `gateway/run_bootstrap.py`, `_browse_reconcile_reserve_wait_s` was `BROWSE_RECONCILE_BUDGET_S + 2.0` (5.0s total). Under contention on a 3-vCPU `macos-latest` runner, the slow browse subprocess required slightly more than 5.0s to detect timeout, abort, and clean up the flock, causing bootstrap reserve to raise `OwnershipConflict` before the lock was released.
+
+### Failure B4: Windows footgun, Ruff PLW1510, and code health ratchet failures in `update_cmd_git.py` (run 43137784970)
+- In `hermes_cli/update_cmd_git.py`, `_probe_fork_bomb` used `subprocess.run(list(argv) + ["--version"], capture_output=True, text=True, timeout=15, creationflags=windows_hide_flags())`. Because `text=True` lacked `encoding="utf-8"` and `errors="replace"`, `check-windows-footguns.py` failed with `[subprocess text=True without explicit encoding=]`. Ruff failed with `PLW1510` for missing explicit `check=False`.
+- In `_probe_fork_bomb` and `_locate_real_git`, broad `except Exception: pass` was used. The code health ratchet (`scripts/code_health`) flagged these with `BLE001` (blind except Exception) and `S110` (try/except/pass).
+
+### Failure B5: Contributor check scanning upstream commits on fork PR (run 43137784970)
+- In `.github/workflows/contributor-check.yml`, `MERGE_BASE=$(git merge-base origin/main HEAD)` assumed the PR targets `origin/main`. PR #4 targets `update/joy-hermes-20261103`.
+- `git merge-base origin/main HEAD` returned an upstream commit from months ago, causing `git log ${MERGE_BASE}..HEAD` to evaluate 30+ upstream commits whose authors were not in `AUTHOR_MAP` or `contributors/emails/`, causing the attribution check to fail.
 
 ## Structural fix
 
@@ -62,6 +72,16 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
    - In `gateway/run_bootstrap.py`:
      - Set `_browse_reconcile_reserve_wait_s` to `BROWSE_RECONCILE_BUDGET_S + 7.0` (10.0s total wait) so gateway bootstrap easily outlasts slow browse reconcile teardown on 3-vCPU macOS runners.
 
+5. **Subprocess and Exception Hygiene in Git Helpers**:
+   - In `hermes_cli/update_cmd_git.py`:
+     - Pass `encoding="utf-8", errors="replace", check=False` to `subprocess.run` in `_probe_fork_bomb`.
+     - Narrow exceptions in `_probe_fork_bomb` to `(OSError, subprocess.SubprocessError)` and log via `logger.debug`.
+     - Narrow exceptions in `_locate_real_git` to `(OSError, ValueError)` and log via `logger.debug`.
+     - Ensure `_portable_git_candidates` preserves the shared and profile `root / "git" / "mingw64"` candidates first to satisfy `#88136`.
+
+6. **Dynamic PR Base Ref in Contributor Check**:
+   - In `.github/workflows/contributor-check.yml`, compute `BASE_REF="${{ github.base_ref || 'main' }}"` and resolve `MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD 2>/dev/null || git merge-base "${BASE_REF}" HEAD 2>/dev/null || git merge-base origin/main HEAD)`.
+
 ## Proof
 
 1. **Failure A Proof**:
@@ -77,3 +97,13 @@ Date: 2026-11-12. Identified from GitHub Actions runs 41752817792 and 4312740520
 4. **Failure B3 Proof**:
    - `pytest tests/gateway/test_journey_compress_restart_fifo.py` passes both `graceful` and `crash` cases cleanly.
    - `pytest tests/hermes_cli/test_browse_schema_drift.py` passes all 29 tests cleanly, including `test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]`.
+
+5. **Failure B4 Proof**:
+   - `uv run --group dev python scripts/check-windows-footguns.py --all` passes with exit code 0.
+   - `ruff check .` passes with exit code 0.
+   - `python scripts/check --only health --base HEAD^1` passes with 0 blocking, 0 advisory violations.
+   - `pytest tests/test_windows_subprocess_no_window_flags.py tests/hermes_cli/test_cmd_update.py` passes 100%.
+
+6. **Failure B5 Proof**:
+   - `.github/workflows/contributor-check.yml` parses cleanly via `yaml.safe_load`.
+   - Local contributor attribution check loop against `fcar/update/joy-hermes-20261103..HEAD` passes with exit code 0.

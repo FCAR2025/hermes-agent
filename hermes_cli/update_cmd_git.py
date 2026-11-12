@@ -581,13 +581,22 @@ def _probe_fork_bomb(argv: list) -> Optional[bool]:
 
         result = run_git(argv, ["--version"], timeout=15, **_GIT_TEXT_KW)
         return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("run_git fork bomb probe failed: %s", exc)
     try:
-        res = subprocess.run(list(argv) + ["--version"], capture_output=True, text=True, timeout=15,
-                             creationflags=windows_hide_flags())
+        res = subprocess.run(
+            list(argv) + ["--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
+            creationflags=windows_hide_flags(),
+        )
         return "fork bomb" in ((res.stdout or "") + (res.stderr or "")).lower()
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("subprocess.run fork bomb probe failed: %s", exc)
         return None
 
 
@@ -621,10 +630,15 @@ def _portable_git_candidates() -> list:
         val = os.environ.get(env_var)
         if val:
             roots.append(Path(val))
+    # Canonical shared and profile roots with mingw64 first (contract for #88136)
     for root in roots:
         with suppress(Exception):
-            for arch in ("mingw64", "clangarm64", "mingw32"):
+            candidates.append(root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe")
+    for root in roots:
+        with suppress(Exception):
+            for arch in ("clangarm64", "mingw32"):
                 candidates.append(root / "git" / arch / "libexec" / "git-core" / "git.exe")
+            for arch in ("mingw64", "clangarm64", "mingw32"):
                 candidates.append(root / arch / "libexec" / "git-core" / "git.exe")
     return candidates
 
@@ -654,8 +668,8 @@ def _locate_real_git() -> Optional[Path]:
             for arch in ("mingw64", "clangarm64", "mingw32"):
                 candidates.append(git_root / arch / "libexec" / "git-core" / "git.exe")
             candidates.append(git_root / "libexec" / "git-core" / "git.exe")
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("Resolving which('git') path failed: %s", exc)
     candidates += _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
