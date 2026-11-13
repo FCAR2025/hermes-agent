@@ -154,3 +154,34 @@ class TestGitTrampolineSelfHeal:
         assert recorded_calls[0][1] == ["--version"]
         assert recorded_calls[0][2].get("cwd") == tmp_path
 
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [ImportError, AttributeError, TypeError, ValueError, RuntimeError],
+    )
+    def test_probe_fork_bomb_and_trampoline_never_raise_on_lookup_errors(
+        self, monkeypatch, exc_cls
+    ):
+        from hermes_cli.update_cmd_git import _git_is_trampoline, _probe_fork_bomb
+
+        def raise_lookup():
+            raise exc_cls("simulated lookup failure")
+
+        monkeypatch.setattr(update_cmd, "_m", raise_lookup)
+
+        assert _probe_fork_bomb(["git"]) is None
+        assert _git_is_trampoline(["git"]) is False
+
+    def test_probe_fork_bomb_and_trampoline_never_raise_on_bad_project_root(
+        self, monkeypatch
+    ):
+        from hermes_cli import main as cli_main
+        from hermes_cli.update_cmd_git import _git_is_trampoline, _probe_fork_bomb
+
+        class _BadFsPath:
+            def __fspath__(self):
+                raise ValueError("invalid PROJECT_ROOT fspath")
+
+        for bad_project_root in (12345, _BadFsPath()):
+            monkeypatch.setattr(cli_main, "PROJECT_ROOT", bad_project_root)
+            assert _probe_fork_bomb(["git"]) is None
+            assert _git_is_trampoline(["git"]) is False

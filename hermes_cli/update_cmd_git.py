@@ -583,10 +583,10 @@ def _probe_fork_bomb(argv: list, cwd=None) -> Optional[bool]:
         root = cwd if cwd is not None else _m().PROJECT_ROOT
         probe_cwd = root if root is not None and Path(root).is_dir() else None
         result = run_git(argv, ["--version"], cwd=probe_cwd, timeout=15, **_GIT_TEXT_KW)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("run_git fork bomb probe failed: %s", exc)
+        return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
+    except Exception as exc:
+        logger.debug("run_git fork bomb probe failed: %s", exc, exc_info=True)
         return None
-    return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
 
 
 def _git_is_trampoline(git_cmd: list) -> bool:

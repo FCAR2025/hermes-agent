@@ -31,11 +31,9 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_completion_guards import (
-    EmptyCompletionError,
-    LiveClaimError,
-    _claim_is_live,
-    _gate_empty_completion,
-    _is_blocked_unclaimed,
+    EmptyCompletionError, LiveClaimError, _claim_is_live,
+    _gate_completion_evidence, _gate_empty_completion,
+    _is_blocked_unclaimed, _synthesized_run_handoff,
 )
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -2626,10 +2624,10 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
-    Strict receipt completion remains mutation-free on rejection.
+    or ``summary``, a stripped result already stored on the card, or verified
+    PR acceptance under ``require_blocked_unclaimed``. Empty or whitespace-only
+    evidence raises :class:`EmptyCompletionError`. Approving a card out of
+    ``review`` stays exempt; strict receipt rejections stay mutation-free.
     ``require_blocked_unclaimed`` is an opt-in terminal-receipt CAS: completion
     proceeds only while the task is still blocked with no run or worker claim.
     """
@@ -2657,7 +2655,10 @@ def complete_task(
         conn, task_id, expected_run_id, metadata,
         defer_contract_binding=require_blocked_unclaimed,
     )
-    if acceptance is False:
+    if acceptance is False or not _gate_completion_evidence(
+        conn, task_id, result=result, summary=summary,
+        require_blocked_unclaimed=require_blocked_unclaimed, acceptance=acceptance,
+    ):
         return False
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
@@ -2694,11 +2695,8 @@ def complete_task(
         params: tuple = (result, now, task_id)
         if require_blocked_unclaimed:
             sql += (
-                " AND status = 'blocked'"
-                " AND current_run_id IS NULL"
-                " AND worker_pid IS NULL"
-                " AND claim_lock IS NULL"
-                " AND claim_expires IS NULL"
+                " AND status = 'blocked' AND current_run_id IS NULL"
+                " AND worker_pid IS NULL AND claim_lock IS NULL AND claim_expires IS NULL"
             )
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -2712,13 +2710,14 @@ def complete_task(
             metadata=metadata,
         )
         # Never-claimed task: synthesize a run so the handoff fields survive.
-        if run_id is None and (summary or metadata or result or prior_status == "review"):
-            synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
+        synth = _synthesized_run_handoff(
+            prior_status=prior_status, summary=summary, result=result,
+            handoff_summary=handoff_summary, metadata=metadata,
+            acceptance=acceptance, review_note=_REVIEW_APPROVED_NOTE,
+        ) if run_id is None else None
+        if synth is not None:
             run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                conn, task_id, outcome="completed", summary=synth[0], metadata=synth[1],
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:

@@ -76,11 +76,13 @@ def _gate_empty_completion(
     *,
     result: Optional[str],
     summary: Optional[str],
+    audit_failure: bool = True,
 ) -> None:
     """Refuse a completion that would leave the card with no evidence.
 
     Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
+    ``_REVIEW_APPROVED_NOTE`` is the documented record. When
+    ``audit_failure=False``, rejection stays read-only for strict CAS callers.
     """
     from hermes_cli.kanban_db import _append_event, _first_line
 
@@ -95,12 +97,55 @@ def _gate_empty_completion(
     stored = row["result"]
     if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
         return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
+    if audit_failure:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_empty_result",
+                {
+                    "result_preview": _first_line(result, 200) or None,
+                    "summary_preview": _first_line(summary, 200) or None,
+                },
+            )
     raise EmptyCompletionError(task_id)
+
+
+def _gate_completion_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    require_blocked_unclaimed: bool,
+    acceptance: object,
+) -> bool:
+    """Enforce empty-completion evidence unless PR acceptance covers a strict receipt."""
+    if not require_blocked_unclaimed or acceptance is not None:
+        return True
+    if not _is_blocked_unclaimed(conn, task_id):
+        return False
+    _gate_empty_completion(
+        conn, task_id, result=result, summary=summary, audit_failure=False,
+    )
+    return True
+
+
+def _synthesized_run_handoff(
+    *,
+    prior_status: Optional[str],
+    summary: Optional[str],
+    result: Optional[str],
+    handoff_summary: Optional[str],
+    metadata: Optional[dict],
+    acceptance: object,
+    review_note: str,
+) -> Optional[tuple[Optional[str], Optional[dict]]]:
+    """Return ``(summary, metadata)`` when a never-claimed card needs a closing run."""
+    if prior_status == "review" and not handoff_summary and not metadata:
+        return review_note, {"source_status": "review", "approval": "manual"}
+    if acceptance is not None and not metadata:
+        pr_url = acceptance[1].get("pr_url")
+        if pr_url:
+            return handoff_summary, {"published_pr": pr_url}
+    if summary or metadata or result or prior_status == "review":
+        return handoff_summary, metadata
+    return None

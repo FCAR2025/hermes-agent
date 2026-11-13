@@ -257,3 +257,36 @@ def test_blocked_unclaimed_completion_binds_accepted_pr_inside_terminal_transact
             "SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
             (tid,),
         ).fetchone()[0] == 1
+
+
+@pytest.mark.platforms("linux")
+def test_blocked_unclaimed_empty_requires_pr_contract_and_synthesizes_pr_run(github):
+    with connect() as conn:
+        unguarded_tid = kb.create_task(
+            conn,
+            title="blocked without PR contract",
+            initial_status="blocked",
+        )
+        before_events = kb.list_events(conn, unguarded_tid)
+        with pytest.raises(kb.EmptyCompletionError):
+            kb.complete_task(conn, unguarded_tid, require_blocked_unclaimed=True)
+        unguarded = kb.get_task(conn, unguarded_tid)
+        assert unguarded is not None
+        assert unguarded.status == "blocked"
+        assert unguarded.result is None
+        assert kb.list_runs(conn, unguarded_tid) == []
+        assert kb.list_events(conn, unguarded_tid) == before_events
+
+        pr_tid = kb.create_task(
+            conn,
+            title="blocked with pre-bound PR URL contract",
+            completion_contract="https://github.com/acme/repo/pull/7",
+            initial_status="blocked",
+        )
+        assert kb.complete_task(conn, pr_tid, require_blocked_unclaimed=True)
+        pr_task = kb.get_task(conn, pr_tid)
+        assert pr_task is not None and pr_task.status == "done"
+        runs = kb.list_runs(conn, pr_tid)
+        assert len(runs) == 1
+        assert runs[0].outcome == "completed"
+        assert runs[0].metadata == {"published_pr": "https://github.com/acme/repo/pull/7"}
