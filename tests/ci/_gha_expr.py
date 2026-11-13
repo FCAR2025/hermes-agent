@@ -26,6 +26,7 @@ _TOKEN = re.compile(r"""\s*(?:
   | (?P<path>[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_*][A-Za-z0-9_-]*)*)
 )""", re.VERBOSE)
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+_LONE_TEMPLATE = re.compile(r"\$\{\{((?:(?!\}\}).)*)\}\}", re.DOTALL)
 
 
 class Unsupported(ValueError):
@@ -201,7 +202,7 @@ class _Parser:
 def evaluate(expr: str, context: Mapping[str, Any]) -> Any:
     """Value of a bare expression or a single ``${{ expr }}``."""
     text = expr.strip()
-    whole = _TEMPLATE.fullmatch(text)
+    whole = _LONE_TEMPLATE.fullmatch(text)
     return _Parser(whole.group(1) if whole else text, context).parse()
 
 
@@ -218,7 +219,7 @@ def render(text: Any, context: Mapping[str, Any]) -> Any:
     """``with:``/``env:``/``run:`` value: a lone ``${{ x }}`` keeps its type, embedded ones stringify."""
     if not isinstance(text, str):
         return text
-    whole = _TEMPLATE.fullmatch(text.strip())
+    whole = _LONE_TEMPLATE.fullmatch(text.strip())
     if whole:
         return evaluate(whole.group(1), context)
     return _TEMPLATE.sub(lambda m: to_string(evaluate(m.group(1), context)), text)
