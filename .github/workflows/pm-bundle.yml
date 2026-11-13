@@ -71,13 +71,13 @@ jobs:
           # - label: linux-x64
           #   runner: blacksmith-32vcpu-ubuntu-2404
           # - label: linux-arm64
-          #   runner: blacksmith-32vcpu-ubuntu-2404-arm
+          #   runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404-arm' || 'ubuntu-24.04-arm' }}
           - label: darwin-arm64
-            runner: blacksmith-12vcpu-macos-15
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-12vcpu-macos-15' || 'macos-latest' }}
           - label: win32-x64
-            runner: blacksmith-32vcpu-windows-2025
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-windows-2025' || 'windows-latest' }}
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:

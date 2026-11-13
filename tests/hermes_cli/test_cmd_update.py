@@ -127,3 +127,61 @@ class TestGitTrampolineSelfHeal:
         assert candidates[1] == (
             profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
         )
+
+    def test_probe_fork_bomb_invokes_run_git_with_project_root_cwd(self, tmp_path, monkeypatch):
+        from hermes_cli import main as cli_main, update_custody
+        from hermes_cli.update_cmd_git import _probe_fork_bomb
+
+        monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+
+        recorded_calls = []
+
+        def fake_run_git(git_cmd, args, **kwargs):
+            recorded_calls.append((git_cmd, args, kwargs))
+            raise FileNotFoundError("fixture: git missing")
+
+        monkeypatch.setattr(update_custody, "run_git", fake_run_git)
+
+        def fail_subprocess_run(*args, **kwargs):
+            pytest.fail("raw subprocess.run must not be called when run_git raises FileNotFoundError")
+
+        monkeypatch.setattr("subprocess.run", fail_subprocess_run)
+
+        result = _probe_fork_bomb(["git"])
+        assert result is None
+        assert len(recorded_calls) == 1
+        assert recorded_calls[0][0] == ["git"]
+        assert recorded_calls[0][1] == ["--version"]
+        assert recorded_calls[0][2].get("cwd") == tmp_path
+
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [ImportError, AttributeError, TypeError, ValueError, RuntimeError],
+    )
+    def test_probe_fork_bomb_and_trampoline_never_raise_on_lookup_errors(
+        self, monkeypatch, exc_cls
+    ):
+        from hermes_cli.update_cmd_git import _git_is_trampoline, _probe_fork_bomb
+
+        def raise_lookup():
+            raise exc_cls("simulated lookup failure")
+
+        monkeypatch.setattr(update_cmd, "_m", raise_lookup)
+
+        assert _probe_fork_bomb(["git"]) is None
+        assert _git_is_trampoline(["git"]) is False
+
+    def test_probe_fork_bomb_and_trampoline_never_raise_on_bad_project_root(
+        self, monkeypatch
+    ):
+        from hermes_cli import main as cli_main
+        from hermes_cli.update_cmd_git import _git_is_trampoline, _probe_fork_bomb
+
+        class _BadFsPath:
+            def __fspath__(self):
+                raise ValueError("invalid PROJECT_ROOT fspath")
+
+        for bad_project_root in (12345, _BadFsPath()):
+            monkeypatch.setattr(cli_main, "PROJECT_ROOT", bad_project_root)
+            assert _probe_fork_bomb(["git"]) is None
+            assert _git_is_trampoline(["git"]) is False

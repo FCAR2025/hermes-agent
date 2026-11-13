@@ -582,7 +582,7 @@ def _start_gateway_resolve_terminal_cwd() -> None:
 # publication and the drift probes, instead of exiting as if another gateway owned the profile.
 def _browse_reconcile_reserve_wait_s() -> float:
     from hermes_state_reconcile import BROWSE_RECONCILE_BUDGET_S
-    return BROWSE_RECONCILE_BUDGET_S + 2.0
+    return max(10.0, BROWSE_RECONCILE_BUDGET_S + 7.0)
 
 
 def _reserve_waiting_out_browse_reconcile(ownership, homes, *, wait_s: float | None = None):

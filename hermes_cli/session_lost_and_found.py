@@ -117,6 +117,12 @@ def _parse_sqlite3_cli_version(binary: str) -> Optional[tuple[int, int, int]]:
 _last_cli_refusal: dict[str, Any] = {}
 
 
+def clear_sqlite3_cli_refusal() -> None:
+    """Clear the last recorded CLI refusal."""
+    global _last_cli_refusal
+    _last_cli_refusal = {}
+
+
 def find_sqlite3_cli_refusal() -> dict[str, Any]:
     """Why the last :func:`find_sqlite3_cli` call in this process refused: ``{"reason": ...}`` with reason in
     ``missing``, ``no_dbpage`` (shell cannot run ``.recover``), ``wal_reset_vulnerable``; empty if it succeeded."""

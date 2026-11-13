@@ -1009,3 +1009,45 @@ def test_every_raw_schema_catch_up_handles_an_old_indexed_column(tmp_path):
         assert not conn.in_transaction
     assert "last_read_at" in _session_columns(path)
     assert hasattr(hermes_state_schema, "apply_declared_schema")
+
+
+def test_durability_barriers_over_budget_rolls_back_and_refuses(tmp_path, monkeypatch):
+    """When _reapply_durability_barriers exceeds the browse budget, browse must
+    refuse with a retryable 503 ('nothing was changed', 'sessions repair') rather than
+    letting OperationalError escape to corrupt-store diagnosis."""
+    import time
+    from fastapi import HTTPException
+    import hermes_state_repair as repair
+    import hermes_state_reconcile as reconcile
+    from hermes_cli.web_server_sessions import _open_session_db_at_path
+
+    home = _profile_home(tmp_path)
+    path = _lagging_store_with_history(home, rows=10)
+    before = _file_state(path)
+
+    clock = [time.monotonic()]
+
+    def fake_monotonic():
+        return clock[0]
+
+    monkeypatch.setattr(time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(reconcile, "_BUDGET_PROGRESS_OPS", 1)
+
+    real_barriers = repair._reapply_durability_barriers
+
+    def slow_barriers(conn):
+        clock[0] += reconcile.BROWSE_RECONCILE_BUDGET_S + 1.0
+        return real_barriers(conn)
+
+    monkeypatch.setattr(repair, "_reapply_durability_barriers", slow_barriers)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _open_session_db_at_path(path, read_only=True)
+
+    exc = exc_info.value
+    assert exc.status_code == 503
+    assert "nothing was changed" in exc.detail
+    assert "sessions repair" in exc.detail
+    assert "Session store schema is unavailable or corrupt" not in exc.detail
+    assert _file_state(path) == before
+

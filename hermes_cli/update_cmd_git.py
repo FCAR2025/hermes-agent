@@ -574,15 +574,19 @@ def _print_fetch_failure(stderr: str, *, git_cmd=None, root: Optional[Path] = No
             print(f"  ... ({len(lines) - 15} more lines omitted)")
 
 
-def _probe_fork_bomb(argv: list) -> Optional[bool]:
+def _probe_fork_bomb(argv: list, cwd=None) -> Optional[bool]:
     """Run ``<argv> --version``; True/False = guard message seen/absent, None = probe itself failed."""
     try:
+        from hermes_cli.update_cmd import _m
         from hermes_cli.update_custody import run_git
 
-        result = run_git(argv, ["--version"], timeout=15, **_GIT_TEXT_KW)
-    except Exception:
+        root = cwd if cwd is not None else _m().PROJECT_ROOT
+        probe_cwd = root if root is not None and Path(root).is_dir() else None
+        result = run_git(argv, ["--version"], cwd=probe_cwd, timeout=15, **_GIT_TEXT_KW)
+        return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
+    except Exception as exc:
+        logger.debug("run_git fork bomb probe failed: %s", exc, exc_info=True)
         return None
-    return "fork bomb" in ((result.stdout or "") + (result.stderr or "")).lower()
 
 
 def _git_is_trampoline(git_cmd: list) -> bool:
@@ -608,8 +612,23 @@ def _portable_git_candidates() -> list:
     """
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
+    roots = []
     with suppress(Exception):
-        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+        roots.extend([get_default_hermes_root(), Path(get_hermes_home())])
+    for env_var in ("HERMES_RUNTIME_DIR", "PM_TOOL_STORE"):
+        val = os.environ.get(env_var)
+        if val:
+            roots.append(Path(val))
+    # Canonical shared and profile roots with mingw64 first (contract for #88136)
+    for root in roots:
+        with suppress(Exception):
+            candidates.append(root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe")
+    for root in roots:
+        with suppress(Exception):
+            for arch in ("clangarm64", "mingw32"):
+                candidates.append(root / "git" / arch / "libexec" / "git-core" / "git.exe")
+            for arch in ("mingw64", "clangarm64", "mingw32"):
+                candidates.append(root / arch / "libexec" / "git-core" / "git.exe")
     return candidates
 
 
@@ -622,11 +641,25 @@ def _locate_real_git() -> Optional[Path]:
     re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
     invoked directly (#87876).
     """
+    import shutil
     candidates = [
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)", os.environ.get("LOCALAPPDATA", r"C:\Program Files"))
+        for arch in ("mingw64", "clangarm64", "mingw32")
+    ]
+    for base in (r"C:\Program Files\Git", r"C:\Program Files (x86)\Git"):
+        candidates.append(Path(base) / "libexec" / "git-core" / "git.exe")
+    which_git = shutil.which("git")
+    if which_git:
+        try:
+            w_path = Path(which_git).resolve()
+            git_root = w_path.parents[1] if len(w_path.parents) >= 2 else w_path.parent
+            for arch in ("mingw64", "clangarm64", "mingw32"):
+                candidates.append(git_root / arch / "libexec" / "git-core" / "git.exe")
+            candidates.append(git_root / "libexec" / "git-core" / "git.exe")
+        except (OSError, ValueError) as exc:
+            logger.debug("Resolving which('git') path failed: %s", exc)
+    candidates += _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
